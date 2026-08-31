@@ -164,9 +164,12 @@ is power-cycled. To avoid it:
 - **MiniMax H3 / FastH3** still needs sequential loading on one GB10. The Qwen3-VL
   conditioner is tens of gigabytes of BF16. If the DiT and VAEs load while that
   encoder is still resident, the process is a typical `earlyoom` kill (Python is
-  preferred). The CUDA pipeline now encodes first, releases the encoder, then
-  loads DiT and VAEs onto the accelerator (`to_cpu` follows `cpu_offload`, which
-  is off here). See [Offloading](../../inference/offloading.md).
+  preferred). Pass `--lazy-module-load` (or omit it: FastVideo auto-enables the
+  flag on unified memory, and `basic_fasth3.py` defaults it on when
+  `--num-gpus 1`). That loads Qwen, releases it, loads the DiT, releases the DiT,
+  then loads the VAE. Geometry scalars come from checkpoint `config.json`, not
+  from live weights. A later `generate()` on the same worker reloads from disk.
+  See [Offloading](../../inference/offloading.md).
 
 ## Gotchas specific to the GB10
 

@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastvideo.configs.pipelines.minimax_h3 import MiniMaxH3PipelineConfig
 from fastvideo.fastvideo_args import FastVideoArgs
+from fastvideo.logger import init_logger
+from fastvideo.models.hf_transformer_utils import get_diffusers_config
 from fastvideo.pipelines.basic.minimax_h3.stages import (
     MiniMaxH3AudioDecodingStage,
     MiniMaxH3ConditioningStage,
@@ -15,6 +19,26 @@ from fastvideo.pipelines.basic.minimax_h3.stages import (
 )
 from fastvideo.pipelines.composed_pipeline_base import ComposedPipelineBase
 from fastvideo.pipelines.lora_pipeline import LoRAPipeline
+
+logger = init_logger(__name__)
+
+
+def _apply_h3_checkpoint_arch_configs(model_path: str, fastvideo_args: FastVideoArgs,
+                                      extra_config_module_map: dict[str, str]) -> None:
+    """Overlay checkpoint config.json onto pipeline configs without loading weights."""
+    root = Path(model_path)
+    vae_dir = root / "vae"
+    if (vae_dir / "config.json").is_file():
+        fastvideo_args.pipeline_config.vae_config.update_model_arch(get_diffusers_config(str(vae_dir)))
+    transformer_dir = root / extra_config_module_map.get("transformer", "transformer")
+    if (transformer_dir / "config.json").is_file():
+        fastvideo_args.pipeline_config.dit_config.update_model_arch(get_diffusers_config(str(transformer_dir)))
+    logger.info(
+        "MiniMax-H3 geometry from config: patch_size=%s spatial_compression_ratio=%s latent_channels=%s",
+        tuple(fastvideo_args.pipeline_config.dit_config.patch_size),
+        int(fastvideo_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio),
+        int(fastvideo_args.pipeline_config.vae_config.arch_config.latent_channels),
+    )
 
 
 class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
@@ -52,9 +76,10 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
         "audio_scheduler",
     ]
-    # Deferral is safe here: no stage reads a component's attributes while it
-    # is being constructed, and `initialize_pipeline` only inspects the
-    # schedulers, which are never deferred.
+    # Deferral is safe here: geometry scalars come from checkpoint config.json
+    # (applied in initialize_pipeline without loading weights), no stage
+    # constructor reads a deferred component, and initialize_pipeline only
+    # inspects the schedulers, which are never deferred.
     _lazy_module_names = ("text_encoder", "transformer", "vae", "audio_vae")
 
     @classmethod
@@ -62,7 +87,7 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
         return tuple(sorted(cls._extra_config_module_map.get(name, name) for name in cls._required_config_modules))
 
     def initialize_pipeline(self, fastvideo_args: FastVideoArgs) -> None:
-        del fastvideo_args
+        _apply_h3_checkpoint_arch_configs(self.model_path, fastvideo_args, self._extra_config_module_map)
         for module_name, modality, expected_shift in (
             ("scheduler", "video", 12.0),
             ("audio_scheduler", "audio", 3.0),
@@ -71,17 +96,21 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
             if shift is None or float(shift) != expected_shift:
                 raise ValueError(f"MiniMax-H3 {modality} scheduler must expose shift={expected_shift:g}, got {shift}.")
 
-    def _add_stages(self, *, ref2va: bool) -> None:
+    def _add_stages(self, fastvideo_args: FastVideoArgs, *, ref2va: bool) -> None:
         transformer = self.get_module("transformer")
         vae = self.get_module("vae")
         audio_vae = self.get_module("audio_vae")
         scheduler = self.get_module("scheduler")
         audio_scheduler = self.get_module("audio_scheduler")
+        # Geometry scalars live on the checkpoint-updated arch config. Holding
+        # the live VAE/DiT here would materialize them on the first attribute
+        # read. Encode still needs the live VAE for FL2VA/Ref2VA.
+        video_geometry = fastvideo_args.pipeline_config.vae_config.arch_config
 
         self.add_stage(
             "input_preparation_stage",
             MiniMaxH3InputPreparationStage(
-                vae=vae,
+                vae=video_geometry,
                 audio_vae=audio_vae if ref2va else None,
                 ref2va=ref2va,
             ),
@@ -98,7 +127,6 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             "latent_preparation_stage",
             MiniMaxH3LatentPreparationStage(
-                transformer=transformer,
                 vae=vae,
                 audio_vae=audio_vae,
                 scheduler=scheduler,
@@ -113,7 +141,7 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
                 audio_scheduler=audio_scheduler,
             ),
         )
-        self.add_stage("video_decoding_stage", MiniMaxH3VideoDecodingStage(vae=vae, transformer=transformer))
+        self.add_stage("video_decoding_stage", MiniMaxH3VideoDecodingStage(vae=vae))
         self.add_stage("audio_decoding_stage", MiniMaxH3AudioDecodingStage(audio_vae=audio_vae))
 
 
@@ -121,8 +149,7 @@ class MiniMaxH3Pipeline(MiniMaxH3BasePipeline):
     """One-request joint video/stereo-audio pipeline for T2VA and FL2VA."""
 
     def create_pipeline_stages(self, fastvideo_args: FastVideoArgs) -> None:
-        del fastvideo_args
-        self._add_stages(ref2va=False)
+        self._add_stages(fastvideo_args, ref2va=False)
 
 
 class MiniMaxH3RefPipeline(MiniMaxH3BasePipeline):
@@ -131,8 +158,7 @@ class MiniMaxH3RefPipeline(MiniMaxH3BasePipeline):
     _extra_config_module_map = {"transformer": "transformer_ref"}
 
     def create_pipeline_stages(self, fastvideo_args: FastVideoArgs) -> None:
-        del fastvideo_args
-        self._add_stages(ref2va=True)
+        self._add_stages(fastvideo_args, ref2va=True)
 
 
 class MiniMaxH3ModularPipeline(MiniMaxH3Pipeline):

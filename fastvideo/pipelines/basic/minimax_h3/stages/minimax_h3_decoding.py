@@ -16,6 +16,7 @@ from fastvideo.models.vaes.minimax_h3_video import AutoencoderKLMiniMaxH3
 from fastvideo.profiler import nvtx_range
 from fastvideo.pipelines.basic.minimax_h3.packing import (
     MiniMaxH3PackedLayout,
+    h3_dit_patch_size,
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )
@@ -58,10 +59,9 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
 
     performance_component_metric = "vae_decode_time_s"
 
-    def __init__(self, vae: AutoencoderKLMiniMaxH3, transformer: Any) -> None:
+    def __init__(self, vae: AutoencoderKLMiniMaxH3) -> None:
         super().__init__()
         self.vae = vae
-        self.transformer = transformer
 
     def verify_input(self, batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> VerificationResult:
         result = VerificationResult()
@@ -97,7 +97,7 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
             latent_height,
             latent_width,
             channels,
-            self.transformer.patch_size,
+            h3_dit_patch_size(fastvideo_args),
         )
         device = get_local_torch_device()
         self.vae.to(device)

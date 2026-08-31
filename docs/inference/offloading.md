@@ -12,7 +12,7 @@ text_encoder_cpu_offload: bool = True
 image_encoder_cpu_offload: bool = True
 vae_cpu_offload: bool = True
 pin_cpu_memory: bool = True
-lazy_module_load: bool = False
+lazy_module_load: bool | None = None
 ```
 
 On unified-memory accelerators such as NVIDIA GB10 and Apple silicon, FastVideo
@@ -23,14 +23,18 @@ memory. CUDA FSDP sharding remains enabled when requested; MPS continues to
 disable FSDP. `pin_cpu_memory` is not an offload mode and is left unchanged.
 
 MiniMax H3 CUDA inference uses a second lever that does not copy weights to a
-host pool. The pipeline loads the Qwen3-VL text encoder, runs conditioning, then
-releases that encoder before it loads the DiT and video/audio VAEs. The MLX FastH3
-runtime uses the same phase order. When host offload is off, DiT safetensors are
-read onto the accelerator instead of CPU-then-copy. Input-preparation geometry
-(spatial ratio, latent channels, audio sample rate) comes from the VAE arch
-configs until those weights load. A later `generate()` on the same worker
-currently re-enters conditioning after the encoder has been released; start a
-new generator for a new prompt until prompt-cache reload exists.
+host pool. With `lazy_module_load`, the pipeline loads the Qwen3-VL text encoder,
+runs conditioning, and releases that encoder before it loads the DiT. After
+denoise it releases the DiT, then loads the video VAE for decode. Input
+preparation and unpatchify read geometry from checkpoint `config.json` (VAE
+spatial ratio / latent channels, DiT patch size) so those stages do not
+materialize weights just to read two integers. The MLX FastH3 runtime uses the
+same phase order. When host offload is off, DiT safetensors are read onto the
+accelerator instead of CPU-then-copy. A later `generate()` on the same worker
+reloads a released component from disk; start a new generator for a new prompt
+until prompt-cache reload exists. The flag is auto-enabled on unified-memory
+devices. Pass `--no-lazy-module-load` (or `lazy_module_load=False`) to keep every
+component resident.
 
 ## Behavior Explanation
 
@@ -109,9 +113,9 @@ By default a pipeline loads every component before the first stage runs, so
 peak memory is the sum of all of them even though no two are needed at the same
 moment. With `lazy_module_load` enabled, each heavy component loads on first use
 and is freed once the last stage that needs it has returned, so peak memory
-becomes the largest overlapping set instead of the sum. For a text-to-video
-pipeline that is roughly `max(text encoder, DiT + VAE)` rather than
-`text encoder + DiT + VAE`.
+becomes the largest overlapping set instead of the sum. MiniMax-H3 T2VA is
+`max(text encoder, DiT, VAE)` rather than `text encoder + DiT + VAE`, because
+the DiT is not held through VAE decode.
 
 #### Performance Impact
 
@@ -126,8 +130,10 @@ and kernel caches when the component structure and input shapes are unchanged.
 Enable this when a model does not fit at load time, which the CPU offload
 options above cannot help with because they act after loading. It is
 particularly relevant on unified-memory devices, where host and device draw on
-the same pool and moving weights to the host frees nothing. Leave it off when
-the model already fits.
+the same pool and moving weights to the host frees nothing. FastVideo
+auto-enables it there (`lazy_module_load=None`). Leave it off when the model
+already fits, or pass `--no-lazy-module-load` to keep components resident for
+later `generate()` calls.
 
 This option applies to inference only. Training keeps every component resident
 and logs a warning if the flag is set.
