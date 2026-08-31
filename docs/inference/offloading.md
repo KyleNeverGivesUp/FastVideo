@@ -28,13 +28,12 @@ runs conditioning, and releases that encoder before it loads the DiT. After
 denoise it releases the DiT, then loads the video VAE for decode. Input
 preparation and unpatchify read geometry from checkpoint `config.json` (VAE
 spatial ratio / latent channels, DiT patch size) so those stages do not
-materialize weights just to read two integers. The MLX FastH3 runtime uses the
-same phase order. When host offload is off, DiT safetensors are read onto the
-accelerator instead of CPU-then-copy. A later `generate()` on the same worker
-reloads a released component from disk; start a new generator for a new prompt
-until prompt-cache reload exists. The flag is auto-enabled on unified-memory
-devices. Pass `--no-lazy-module-load` (or `lazy_module_load=False`) to keep every
-component resident.
+materialize weights just to read two integers. When host offload is off, DiT
+safetensors are read onto the accelerator instead of CPU-then-copy. A later
+`generate()` on the same worker reloads a released component from disk in
+process; it does not need a new generator. The flag is auto-enabled on
+unified-memory devices. Pass `--no-lazy-module-load` (or `lazy_module_load=False`)
+to keep every component resident.
 
 ## Behavior Explanation
 
