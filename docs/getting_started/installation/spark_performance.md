@@ -167,6 +167,12 @@ is power-cycled. To avoid it:
   preferred). The CUDA pipeline now encodes first, releases the encoder, then
   loads DiT and VAEs onto the accelerator (`to_cpu` follows `cpu_offload`, which
   is off here). See [Offloading](../../inference/offloading.md).
+- **FastH3 TAEH3** (`--lazy-module-load --video-decode-backend taeh3`) is an
+  opt-in preview decoder. T2VA never materializes the 9.7 GiB video VAE. On this
+  box, alpine 768×1344×124 decoded in **2.4 s** versus **68 s** for the full VAE,
+  and one lazy-load T2VA generation finished in **224 s** end-to-end. 1761 plus
+  the full VAE still OOMs that canvas. Reconstruction is approximate, not
+  lossless. FL2VA/Ref2VA still need the full VAE to encode references.
 
 ## Gotchas specific to the GB10
 

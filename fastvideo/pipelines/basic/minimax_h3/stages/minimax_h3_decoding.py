@@ -58,7 +58,7 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
 
     performance_component_metric = "vae_decode_time_s"
 
-    def __init__(self, vae: AutoencoderKLMiniMaxH3, transformer: Any) -> None:
+    def __init__(self, vae: AutoencoderKLMiniMaxH3 | None, transformer: Any) -> None:
         super().__init__()
         self.vae = vae
         self.transformer = transformer
@@ -100,6 +100,29 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
             self.transformer.patch_size,
         )
         device = get_local_torch_device()
+        backend = getattr(fastvideo_args, "video_decode_backend", "h3-vae")
+        if backend == "taeh3":
+            from fastvideo.models.vaes.minimax_h3_taeh3 import decode_ncthw_latents_taeh3, taeh3_decoded_pixel_shape
+
+            if fastvideo_args.output_type == "latent":
+                batch.output = latents.detach().float().cpu() if is_output_rank else placeholder
+                return batch
+            expected = taeh3_decoded_pixel_shape(tuple(latents.shape))
+            logger.info("MiniMax-H3 video decode: TAEH3 preview (%s -> %s)", tuple(latents.shape), expected)
+            with nvtx_range("minimax_h3.taeh3"):
+                pixels = decode_ncthw_latents_taeh3(
+                    latents,
+                    device=device,
+                    checkpoint_path=getattr(fastvideo_args, "taeh3_checkpoint", None),
+                    chunk_size=int(getattr(fastvideo_args, "taeh3_chunk_size", 5) or 5),
+                )
+            batch.output = pixels.float().cpu() if is_output_rank else placeholder
+            if is_output_rank and tuple(batch.output.shape) != expected:
+                raise RuntimeError(f"TAEH3 wrote {tuple(batch.output.shape)}, expected {expected}.")
+            return batch
+
+        if self.vae is None:
+            raise RuntimeError("MiniMax-H3 full VAE decode requires a loaded video VAE.")
         self.vae.to(device)
         try:
             latents = self.vae.denormalize_latents(latents.to(device=device, dtype=torch.float32))

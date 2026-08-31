@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from fastvideo.configs.models.vaes.minimax_h3_video import MiniMaxH3VideoVAEArchConfig
 from fastvideo.configs.pipelines.minimax_h3 import MiniMaxH3PipelineConfig
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.pipelines.basic.minimax_h3.stages import (
@@ -71,17 +72,22 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
             if shift is None or float(shift) != expected_shift:
                 raise ValueError(f"MiniMax-H3 {modality} scheduler must expose shift={expected_shift:g}, got {shift}.")
 
-    def _add_stages(self, *, ref2va: bool) -> None:
+    def _add_stages(self, fastvideo_args: FastVideoArgs, *, ref2va: bool) -> None:
         transformer = self.get_module("transformer")
         vae = self.get_module("vae")
         audio_vae = self.get_module("audio_vae")
         scheduler = self.get_module("scheduler")
         audio_scheduler = self.get_module("audio_scheduler")
+        use_taeh3 = getattr(fastvideo_args, "video_decode_backend", "h3-vae") == "taeh3"
+        # T2VA preview with TAEH3 only needs VAE geometry scalars. Passing the
+        # arch config keeps the 9.7 GiB ViT decoder from materializing.
+        video_geometry = MiniMaxH3VideoVAEArchConfig() if use_taeh3 and not ref2va else vae
+        decode_vae = None if use_taeh3 else vae
 
         self.add_stage(
             "input_preparation_stage",
             MiniMaxH3InputPreparationStage(
-                vae=vae,
+                vae=video_geometry,
                 audio_vae=audio_vae if ref2va else None,
                 ref2va=ref2va,
             ),
@@ -99,7 +105,7 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
             "latent_preparation_stage",
             MiniMaxH3LatentPreparationStage(
                 transformer=transformer,
-                vae=vae,
+                vae=video_geometry,
                 audio_vae=audio_vae,
                 scheduler=scheduler,
                 ref2va=ref2va,
@@ -113,7 +119,7 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
                 audio_scheduler=audio_scheduler,
             ),
         )
-        self.add_stage("video_decoding_stage", MiniMaxH3VideoDecodingStage(vae=vae, transformer=transformer))
+        self.add_stage("video_decoding_stage", MiniMaxH3VideoDecodingStage(vae=decode_vae, transformer=transformer))
         self.add_stage("audio_decoding_stage", MiniMaxH3AudioDecodingStage(audio_vae=audio_vae))
 
 
@@ -121,8 +127,7 @@ class MiniMaxH3Pipeline(MiniMaxH3BasePipeline):
     """One-request joint video/stereo-audio pipeline for T2VA and FL2VA."""
 
     def create_pipeline_stages(self, fastvideo_args: FastVideoArgs) -> None:
-        del fastvideo_args
-        self._add_stages(ref2va=False)
+        self._add_stages(fastvideo_args, ref2va=False)
 
 
 class MiniMaxH3RefPipeline(MiniMaxH3BasePipeline):
@@ -131,8 +136,7 @@ class MiniMaxH3RefPipeline(MiniMaxH3BasePipeline):
     _extra_config_module_map = {"transformer": "transformer_ref"}
 
     def create_pipeline_stages(self, fastvideo_args: FastVideoArgs) -> None:
-        del fastvideo_args
-        self._add_stages(ref2va=True)
+        self._add_stages(fastvideo_args, ref2va=True)
 
 
 class MiniMaxH3ModularPipeline(MiniMaxH3Pipeline):

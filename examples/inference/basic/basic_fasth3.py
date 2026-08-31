@@ -54,6 +54,11 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
                         "needs it, so peak memory is the largest overlapping set instead of the sum of every "
                         "component. Enable when the model does not fit at load time; costs a reload per "
                         "generation, so leave it off when it does fit")
+    parser.add_argument("--video-decode-backend",
+                        choices=("h3-vae", "taeh3"),
+                        default="h3-vae",
+                        help="h3-vae is the full MiniMax VAE; taeh3 is the fast approximate preview decoder")
+    parser.add_argument("--taeh3-checkpoint", default=None, help="local taeh3.safetensors; unset uses the pinned cache")
     parser.add_argument("--profile",
                         choices=("all", "strict"),
                         default="all",
@@ -235,6 +240,10 @@ def build_generator_config(args: argparse.Namespace) -> GeneratorConfig:
         "vae_parallel_decode": args.parallel_vae,
         "vae_parallel_decode_strategy": "gather",
     }
+    if args.video_decode_backend != "h3-vae":
+        experimental["video_decode_backend"] = args.video_decode_backend
+    if args.taeh3_checkpoint is not None:
+        experimental["taeh3_checkpoint"] = args.taeh3_checkpoint
     if use_vsa:
         experimental.update({
             "VSA_sparsity": args.vsa_sparsity,

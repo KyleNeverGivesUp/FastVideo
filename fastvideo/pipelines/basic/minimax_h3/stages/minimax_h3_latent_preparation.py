@@ -176,6 +176,9 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
             raise TypeError("MiniMax-H3 keyframes must be a list.")
         if not keyframes:
             return None, None
+        if not hasattr(self.vae, "encode_keyframe"):
+            raise RuntimeError("TAEH3 T2VA preview decode does not load the video VAE. "
+                               "FL2VA keyframes still need --video-decode-backend h3-vae.")
 
         vae_device = get_local_torch_device()
         self.vae.to(vae_device)
