@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=mxfp8-smoke
 #SBATCH --output=/home/kyle/mxfp8-smoke-%j.log
-#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=00:10:00
