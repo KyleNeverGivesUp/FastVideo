@@ -8,7 +8,7 @@
 set -uo pipefail
 export HF_HOME=/home/kyle/fastvideo-lab/models
 cd /home/kyle/fastvideo-lab/FastVideo
-source .venv/bin/activate
+source /home/kyle/fastvideo-lab/.venv/bin/activate
 
 # Pull just the one file from PR 1796. It imports only torch, triton and
 # quack, so nothing else from that branch is needed and the checkout is
@@ -73,16 +73,24 @@ if err.item() < 0.05:
 else:
     print("VERDICT: RUNS BUT WRONG - kernel executed, rel err %.4f is too high" % err.item())
 
-# Quick timing vs bf16 at the same shape, n=50 after warmup.
+# M sweep: H3's real FFN sees tens to hundreds of thousands of rows per
+# forward, so a single small M says nothing about the workload. Timing is
+# GEMM only; quantization cost excluded on both sides.
 import time
-for _ in range(10): mod.mxfp8_scaled_mm(xq, xs, wq, ws, None)
-torch.cuda.synchronize(); t0 = time.perf_counter()
-for _ in range(50): mod.mxfp8_scaled_mm(xq, xs, wq, ws, None)
-torch.cuda.synchronize(); t_mx = (time.perf_counter() - t0) / 50
-xb, wb = x, w
-for _ in range(10): xb @ wb.T
-torch.cuda.synchronize(); t0 = time.perf_counter()
-for _ in range(50): xb @ wb.T
-torch.cuda.synchronize(); t_bf = (time.perf_counter() - t0) / 50
-print("gemm only: bf16 %.3f ms, mxfp8 %.3f ms, ratio %.2fx" % (t_bf*1e3, t_mx*1e3, t_bf/t_mx))
+def bench(fn, n=30, warm=8):
+    for _ in range(warm): fn()
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    for _ in range(n): fn()
+    torch.cuda.synchronize(); return (time.perf_counter() - t0) / n
+print("\nM sweep, K=%d N=%d, GEMM only:" % (K, N))
+print("%10s %12s %12s %8s" % ("M", "bf16 ms", "mxfp8 ms", "ratio"))
+for M2 in (512, 4096, 32768, 131072, 262144):
+    x2 = torch.randn(M2, K, dtype=torch.bfloat16, device=dev)
+    x2q, x2s = mod.quantize_mxfp8_blockwise(x2)
+    t_bf = bench(lambda: x2 @ w.T)
+    t_mx = bench(lambda: mod.mxfp8_scaled_mm(x2q, x2s, wq, ws, None))
+    tf = 2*M2*K*N/t_bf/1e12
+    print("%10d %9.3f (%3.0fTF) %9.3f %7.2fx" % (M2, t_bf*1e3, tf, t_mx*1e3, t_bf/t_mx))
+    del x2, x2q, x2s
+    torch.cuda.empty_cache()
 PY
