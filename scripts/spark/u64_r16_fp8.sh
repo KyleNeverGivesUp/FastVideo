@@ -44,8 +44,7 @@ if quant == "fp8":
     config.engine.quantization = QuantizationConfig(transformer_quant="FP8")
 print(f"[{tag}] quantization =", config.engine.quantization)
 
-from fastvideo import VideoGenerator
-gen = VideoGenerator.from_config(config)
+gen = mod.VideoGenerator.from_config(config)
 t0 = time.perf_counter()
 result = gen.generate(mod.build_request(args, __import__("pathlib").Path(f"outputs/u64_{tag}/clip.mp4"), args.seed))
 wall = time.perf_counter() - t0
