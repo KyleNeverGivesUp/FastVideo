@@ -32,6 +32,12 @@ scheduler,audio_scheduler,modular_model_index.json} /path/to/FastH3-nvfp4/
 
 Use ``--report-only`` to quantize every language linear, print the relative
 error of the FP4 GEMM against the bf16 product, and write nothing.
+
+``--keep-bf16 mlp.down_proj`` leaves one projection kind in bf16 in every
+layer and records it in ``modules_to_not_convert`` so the loader builds those
+linears unquantized. The SwiGLU product feeding ``down_proj`` carries the
+widest activation outliers in the stack, so it is the first candidate when
+4-bit everywhere costs too much quality.
 """
 
 from __future__ import annotations
@@ -67,6 +73,8 @@ DEFAULT_NUM_LAYERS = 50
 LANGUAGE_LINEAR = re.compile(r"^model\.language_model\.layers\.(?P<layer>\d+)\."
                              r"(?P<proj>self_attn\.(?:q|k|v|o)_proj|mlp\.(?:gate|up|down)_proj)\.weight$")
 LANGUAGE_LAYER = re.compile(r"^model\.language_model\.layers\.(?P<layer>\d+)\.")
+PROJECTIONS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj",
+               "mlp.up_proj", "mlp.down_proj")
 
 # Keys the converter drops on purpose, with the reason each.
 SKIPPED_KEYS = {
@@ -87,9 +95,17 @@ def parse_args() -> argparse.Namespace:
                         help="rows of random activations per linear for the error report, 0 disables it")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--report-only", action="store_true", help="quantize and report errors, write nothing")
+    parser.add_argument("--keep-bf16", action="append", default=[], metavar="PROJ",
+                        help="projection kind to leave in bf16 in every layer, e.g. mlp.down_proj; "
+                        "repeat or comma-separate for several")
     args = parser.parse_args()
     if not args.report_only and args.dst is None:
         parser.error("--dst is required unless --report-only is given")
+    keep = [name.strip() for entry in args.keep_bf16 for name in entry.split(",") if name.strip()]
+    unknown = sorted(set(keep) - set(PROJECTIONS))
+    if unknown:
+        parser.error(f"--keep-bf16 got unknown projection(s) {unknown}; choose from {list(PROJECTIONS)}")
+    args.keep_bf16 = tuple(dict.fromkeys(keep))
     return args
 
 
@@ -218,6 +234,8 @@ def main() -> None:
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.probe_rows else None
 
     quantized = 0
+    kept_bf16 = 0
+    kept_bf16_bytes = 0
     copied = 0
     skipped: dict[str, list[str]] = defaultdict(list)
     source_language_bytes = 0
@@ -241,6 +259,11 @@ def main() -> None:
                     writer.add(key, tensor.contiguous())
                     copied += 1
                     continue
+                if linear_match["proj"] in args.keep_bf16:
+                    writer.add(key, tensor.contiguous())
+                    kept_bf16 += 1
+                    kept_bf16_bytes += tensor.numel() * tensor.element_size()
+                    continue
                 packed, scale, global_scale, error = quantize_language_linear(
                     tensor, device, sf_layout, args.probe_rows, generator)
                 prefix = key[:-len(".weight")]
@@ -260,6 +283,7 @@ def main() -> None:
     if dst is not None:
         config = json.loads((src / "config.json").read_text(encoding="utf-8"))
         config["quantization_config"] = serialized_nvfp4_quantization_config(
+            keep_bf16=args.keep_bf16,
             producer={
                 "converter": Path(__file__).name,
                 "flashinfer": flashinfer_version,
@@ -272,6 +296,9 @@ def main() -> None:
                 shutil.copy2(extra, dst / extra.name)
 
     print(f"language linears quantized: {quantized}")
+    if args.keep_bf16:
+        print(f"language linears kept bf16: {kept_bf16} ({', '.join(args.keep_bf16)}; "
+              f"{kept_bf16_bytes / 1e9:.2f} GB)")
     print(f"tensors copied unchanged:   {copied}")
     for reason, keys in skipped.items():
         print(f"skipped {len(keys):>4} keys: {reason}: {SKIPPED_KEYS[reason]}")

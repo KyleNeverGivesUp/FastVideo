@@ -71,9 +71,13 @@ def test_h3_accepts_only_the_serialized_nvfp4_contract() -> None:
         MiniMaxH3SerializedNVFP4Config.from_config(_checkpoint_quantization_config(fmt="e4m3"))
     with pytest.raises(ValueError, match="vision stack"):
         MiniMaxH3SerializedNVFP4Config.from_config(_checkpoint_quantization_config(modules_to_not_convert=["lm_head"]))
-    with pytest.raises(ValueError, match="partially quantized language"):
+    with pytest.raises(ValueError, match="per projection kind, not per layer"):
         MiniMaxH3SerializedNVFP4Config.from_config(
             _checkpoint_quantization_config(modules_to_not_convert=["model.visual", "language_model.layers.3"]))
+    kept = MiniMaxH3SerializedNVFP4Config.from_config(
+        _checkpoint_quantization_config(modules_to_not_convert=["model.visual", "lm_head", "mlp.down_proj"]))
+    assert kept.bf16_suffixes == ("mlp.down_proj", )
+    assert config.bf16_suffixes == ()
     with pytest.raises(ValueError, match="quant_method 'fp8'"):
         MiniMaxH3SerializedNVFP4Config.from_config(_checkpoint_quantization_config(quant_method="fp8"))
 
@@ -83,6 +87,35 @@ def test_converter_metadata_round_trips_and_tolerates_producer_notes() -> None:
     config = MiniMaxH3SerializedNVFP4Config.from_config(metadata)
     assert config.group_size == 16
     assert metadata["producer"]["flashinfer"] == "0.6.13rc2"
+
+    mixed = serialized_nvfp4_quantization_config(keep_bf16=("mlp.down_proj", ))
+    assert mixed["modules_to_not_convert"] == ["model.visual", "lm_head", "mlp.down_proj"]
+    assert MiniMaxH3SerializedNVFP4Config.from_config(mixed).bf16_suffixes == ("mlp.down_proj", )
+
+
+def test_kept_bf16_projection_builds_a_plain_linear(distributed_setup) -> None:
+    config = MiniMaxH3SerializedNVFP4Config.from_config(
+        _checkpoint_quantization_config(modules_to_not_convert=["model.visual", "lm_head", "mlp.down_proj"]))
+    down = ColumnParallelLinear(
+        input_size=128,
+        output_size=128,
+        bias=False,
+        quant_config=config,
+        prefix="minimax_h3_qwen3_vl.language_model.layers.0.mlp.down_proj",
+    )
+    up = ColumnParallelLinear(
+        input_size=128,
+        output_size=128,
+        bias=False,
+        quant_config=config,
+        prefix="minimax_h3_qwen3_vl.language_model.layers.0.mlp.up_proj",
+    )
+
+    assert isinstance(down.quant_method, UnquantizedLinearMethod)
+    assert down.weight is not None and down.weight.shape == (128, 128)
+    assert not hasattr(down, "weight_packed")
+    assert isinstance(up.quant_method, MiniMaxH3SerializedNVFP4LinearMethod)
+    assert up.weight is None
 
 
 def test_serialized_nvfp4_allocates_packed_weight_and_scales_without_a_bf16_weight(distributed_setup) -> None:

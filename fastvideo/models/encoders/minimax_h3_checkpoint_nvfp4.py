@@ -24,6 +24,10 @@ The checkpoint selects this path through ``config.json``::
                             "scale_layout": "128x4", "activation_scheme": "dynamic",
                             "modules_to_not_convert": ["model.visual", "lm_head"]}
 
+Whole projection kinds may stay bf16 by listing their suffix in
+``modules_to_not_convert`` (for example ``"mlp.down_proj"``); those linears
+keep a plain ``weight`` and the unquantized method.
+
 Single GPU only: packed columns and swizzled scale rows cannot be narrowed per
 tensor-parallel rank without repacking.
 """
@@ -85,8 +89,16 @@ def nvfp4_weight_global_scale(weight: torch.Tensor) -> torch.Tensor:
     return ((_E4M3_MAX * _E2M1_MAX) / amax).to(torch.float32)
 
 
-def serialized_nvfp4_quantization_config(*, producer: dict[str, Any] | None = None) -> dict[str, Any]:
-    """The ``config.json`` ``quantization_config`` the converter writes and ``from_config`` accepts."""
+def serialized_nvfp4_quantization_config(
+    *,
+    keep_bf16: tuple[str, ...] | list[str] = (),
+    producer: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The ``config.json`` ``quantization_config`` the converter writes and ``from_config`` accepts.
+
+    ``keep_bf16`` lists projection suffixes such as ``mlp.down_proj`` that stay
+    bf16 in every language layer; they are appended to ``modules_to_not_convert``.
+    """
     config: dict[str, Any] = {
         "quant_method": "nvfp4",
         "activation_scheme": "dynamic",
@@ -94,7 +106,7 @@ def serialized_nvfp4_quantization_config(*, producer: dict[str, Any] | None = No
         "group_size": NVFP4_GROUP_SIZE,
         "scale_fmt": "e4m3",
         "scale_layout": NVFP4_SCALE_LAYOUT,
-        "modules_to_not_convert": ["model.visual", "lm_head"],
+        "modules_to_not_convert": ["model.visual", "lm_head", *keep_bf16],
     }
     if producer:
         config["producer"] = dict(producer)
@@ -137,7 +149,7 @@ def _nvfp4_linear(
 class MiniMaxH3SerializedNVFP4Config(QuantizationConfig):
     """Serialized 16-group NVFP4 contract for the H3 text encoder."""
 
-    def __init__(self, group_size: int, scale_layout: str) -> None:
+    def __init__(self, group_size: int, scale_layout: str, bf16_suffixes: tuple[str, ...] = ()) -> None:
         super().__init__()
         if group_size != NVFP4_GROUP_SIZE:
             raise ValueError(f"MiniMax-H3 serialized NVFP4 requires group_size={NVFP4_GROUP_SIZE}, got {group_size}")
@@ -146,6 +158,9 @@ class MiniMaxH3SerializedNVFP4Config(QuantizationConfig):
                              f"got {scale_layout!r}")
         self.group_size = group_size
         self.scale_layout = scale_layout
+        # Projection suffixes the checkpoint kept in bf16 in every language
+        # layer, e.g. ("mlp.down_proj",). Those linears load a plain weight.
+        self.bf16_suffixes = tuple(bf16_suffixes)
         self.is_checkpoint_nvfp4_serialized = True
         self.activation_scheme = "dynamic"
 
@@ -183,17 +198,22 @@ class MiniMaxH3SerializedNVFP4Config(QuantizationConfig):
         ignored_layers = config.get("modules_to_not_convert", config.get("ignored_layers", []))
         if not isinstance(ignored_layers, list | tuple):
             raise ValueError("MiniMax-H3 serialized NVFP4 modules_to_not_convert must be a sequence")
-        language_exclusions = [
-            name for name in ignored_layers
-            if isinstance(name, str) and (name.startswith("language_model.") or ".language_model." in name)
-        ]
-        if language_exclusions:
-            raise ValueError("MiniMax-H3 does not support partially quantized language stacks; "
-                             f"ignored language layers: {language_exclusions[:3]}")
         if not any(isinstance(name, str) and "visual" in name for name in ignored_layers):
             raise ValueError("MiniMax-H3 serialized NVFP4 requires the vision stack to be listed in "
                              "modules_to_not_convert")
-        return cls(group_size, scale_layout)
+        bf16_suffixes: list[str] = []
+        for name in ignored_layers:
+            if not isinstance(name, str) or "visual" in name or name == "lm_head" or name.endswith(".lm_head"):
+                continue
+            # A whole projection kind may stay bf16 across every language layer
+            # (``mlp.down_proj``); excluding individual layers is not a contract
+            # this loader supports.
+            if "layers." in name or name.startswith("language_model") or ".language_model." in name:
+                raise ValueError("MiniMax-H3 serialized NVFP4 keeps bf16 per projection kind, not per layer; "
+                                 f"got modules_to_not_convert entry {name!r}. Use a suffix such as "
+                                 "'mlp.down_proj'.")
+            bf16_suffixes.append(name)
+        return cls(group_size, scale_layout, tuple(bf16_suffixes))
 
     def validate_runtime(self, device: torch.device) -> None:
         if device.type != "cuda":
@@ -208,10 +228,15 @@ class MiniMaxH3SerializedNVFP4Config(QuantizationConfig):
                                f"got unsupported sm{capability_number}")
         _require_flashinfer_fp4()
 
+    def is_kept_bf16(self, prefix: str) -> bool:
+        return any(prefix == suffix or prefix.endswith("." + suffix) for suffix in self.bf16_suffixes)
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        if isinstance(layer, LinearBase) and ".language_model.layers." in prefix:
-            return MiniMaxH3SerializedNVFP4LinearMethod(self.group_size)
-        return None
+        if not isinstance(layer, LinearBase) or ".language_model.layers." not in prefix:
+            return None
+        if self.is_kept_bf16(prefix):
+            return None
+        return MiniMaxH3SerializedNVFP4LinearMethod(self.group_size)
 
 
 class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
