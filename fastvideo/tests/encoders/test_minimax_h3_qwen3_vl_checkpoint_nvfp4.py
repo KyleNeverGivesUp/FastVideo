@@ -97,8 +97,10 @@ def test_serialized_nvfp4_allocates_packed_weight_and_scales_without_a_bf16_weig
     assert layer.weight_scale.shape == (256, 8)
     assert layer.weight_global_scale.dtype == torch.float32
     assert layer.weight_global_scale.shape == (1, )
-    assert getattr(layer.weight_packed, "weight_loader", None) is layer.weight_loader
-    assert getattr(layer.weight_global_scale, "weight_loader", None) is layer.weight_loader
+    # Bound methods are fresh objects on every attribute access, so compare by equality.
+    assert getattr(layer.weight_packed, "weight_loader", None) == layer.weight_loader
+    assert getattr(layer.weight_scale, "weight_loader", None) == layer.weight_loader
+    assert getattr(layer.weight_global_scale, "weight_loader", None) == layer.weight_loader
 
     _fill_loaded(layer, global_scale=4.0)
     packed_pointer = layer.weight_packed.data_ptr()
