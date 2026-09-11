@@ -452,7 +452,8 @@ class TextEncoderLoader(ComponentLoader):
 
             if checkpoint_quant_config is not None:
                 processed_linears = _process_quantized_text_encoder_weights(model, runtime_device)
-                logger.info("Validated %d serialized blockwise FP8 text-encoder linears", processed_linears)
+                logger.info("Validated %d serialized %s text-encoder linears", processed_linears,
+                            checkpoint_quant_config.get_name())
 
             # Explicitly move model to target device after loading weights
             model = model.to(target_device)
