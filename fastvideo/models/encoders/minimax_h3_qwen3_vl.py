@@ -505,16 +505,26 @@ class MiniMaxH3Qwen3VLConditioner(TextEncoder[torch.Tensor]):
     """H3 conditioner returning the unnormalized layer-50 hidden tensor."""
 
     supports_hf_from_pretrained = False
-    supported_checkpoint_quantization_methods = frozenset({"fp8", "nvfp4"})
+    # Serialized quantization contracts this conditioner can load, keyed by the
+    # ``quant_method`` a checkpoint declares. The loader gates on the key set
+    # before calling the factory, so both stay in step by construction.
+    _checkpoint_quantization_configs: dict[str, type[QuantizationConfig]] = {
+        MiniMaxH3SerializedFP8Config.get_name(): MiniMaxH3SerializedFP8Config,
+        MiniMaxH3SerializedNVFP4Config.get_name(): MiniMaxH3SerializedNVFP4Config,
+    }
+    supported_checkpoint_quantization_methods = frozenset(_checkpoint_quantization_configs)
 
     @classmethod
     def checkpoint_quantization_config_from_metadata(
         cls,
         metadata: dict[str, Any],
     ) -> QuantizationConfig:
-        if str(metadata.get("quant_method", "")).lower() == "nvfp4":
-            return MiniMaxH3SerializedNVFP4Config.from_config(metadata)
-        return MiniMaxH3SerializedFP8Config.from_config(metadata)
+        quant_method = str(metadata.get("quant_method", "")).lower()
+        config_cls = cls._checkpoint_quantization_configs.get(quant_method)
+        if config_cls is None:
+            raise ValueError(f"MiniMax-H3 has no serialized {quant_method!r} text-encoder contract; "
+                             f"supported: {sorted(cls._checkpoint_quantization_configs)}")
+        return config_cls.from_config(metadata)
 
     def __init__(self, config: MiniMaxH3Qwen3VLConfig) -> None:
         super().__init__(config)
@@ -760,4 +770,5 @@ EntryClass = MiniMaxH3Qwen3VLConditioner
 __all__ = [
     "MiniMaxH3Qwen3VLConditioner",
     "MiniMaxH3SerializedFP8Config",
+    "MiniMaxH3SerializedNVFP4Config",
 ]

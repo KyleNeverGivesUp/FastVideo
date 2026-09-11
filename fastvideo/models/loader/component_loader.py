@@ -450,6 +450,15 @@ class TextEncoderLoader(ComponentLoader):
                 self.counter_after_loading_weights - self.counter_before_loading_weights,
             )
 
+            # Strict check for unquantized models and for serialized checkpoint
+            # schemes, which track every loaded tensor. It runs before the
+            # post-load hooks so a missing tensor is reported by name here
+            # instead of as one anonymous "not loaded" failure inside a hook.
+            weights_not_loaded = weights_to_load - loaded_weights
+            if weights_not_loaded and (model_config.quant_config is None or checkpoint_quant_config is not None):
+                raise ValueError("Following weights were not initialized from "
+                                 f"checkpoint: {weights_not_loaded}")
+
             if checkpoint_quant_config is not None:
                 processed_linears = _process_quantized_text_encoder_weights(model, runtime_device)
                 logger.info("Validated %d serialized %s text-encoder linears", processed_linears,
@@ -493,14 +502,6 @@ class TextEncoderLoader(ComponentLoader):
                         fsdp_shard_conditions=model._fsdp_shard_conditions,
                         pin_cpu_memory=pin_cpu_memory,
                     )
-            # We only enable strict check for non-quantized models
-            # that have loaded weights tracking currently.
-            # if loaded_weights is not None:
-            weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded and (model_config.quant_config is None or checkpoint_quant_config is not None):
-                raise ValueError("Following weights were not initialized from "
-                                 f"checkpoint: {weights_not_loaded}")
-
         return model.eval()
 
 

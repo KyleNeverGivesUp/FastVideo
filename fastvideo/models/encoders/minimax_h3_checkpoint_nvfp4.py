@@ -18,18 +18,23 @@ sfLayout=SfLayout.layout_128x4)`` returns, so loading them reproduces the state
 materializing the bf16 weight. Activations are quantized per call with a unit
 global scale and multiplied with ``flashinfer.mm_fp4``.
 
-The checkpoint selects this path through ``config.json``::
+The checkpoint selects this path through ``config.json``; every field is
+required so a checkpoint from another exporter cannot pass by omission::
 
-    "quantization_config": {"quant_method": "nvfp4", "group_size": 16,
-                            "scale_layout": "128x4", "activation_scheme": "dynamic",
+    "quantization_config": {"quant_method": "nvfp4", "activation_scheme": "dynamic",
+                            "fmt": "e2m1", "group_size": 16, "scale_fmt": "e4m3",
+                            "scale_layout": "128x4",
                             "modules_to_not_convert": ["model.visual", "lm_head"]}
 
 Whole projection kinds may stay bf16 by listing their suffix in
 ``modules_to_not_convert`` (for example ``"mlp.down_proj"``); those linears
-keep a plain ``weight`` and the unquantized method.
+keep a plain ``weight`` and the unquantized method. Only the seven language
+projection names are accepted there, so a typo fails at config time.
 
 Single GPU only: packed columns and swizzled scale rows cannot be narrowed per
-tensor-parallel rank without repacking.
+tensor-parallel rank without repacking. Missing tensors are reported by the
+loader's strict check before the post-load hook runs; the hook adds only the
+content checks a copied tensor can still fail.
 """
 
 from typing import Any
@@ -45,6 +50,7 @@ from fastvideo.layers.quantization.nvfp4_config import (
     _coerce_fp4_input_dtype,
     _mm_fp4,
     _nvfp4_quantize,
+    _register_ops_once,
     _require_flashinfer,
 )
 from fastvideo.models.utils import set_weight_attrs
@@ -57,11 +63,25 @@ NVFP4_SCALE_LAYOUT = "128x4"
 # linear satisfies this (out in {1024, 5120, 8192, 25600}, in in {5120, 8192, 25600}).
 NVFP4_ROW_TILE = 128
 NVFP4_COLUMN_MULTIPLE = 4 * NVFP4_GROUP_SIZE
+# The linears of one Qwen3-VL language layer, as the checkpoint and the model name them.
+LANGUAGE_PROJECTIONS = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+)
+_REQUIRED_METADATA_KEYS = ("activation_scheme", "fmt", "group_size", "scale_fmt", "scale_layout",
+                           "modules_to_not_convert")
 _E2M1_MAX = 6.0
 _E4M3_MAX = 448.0
-# An E4M3 byte of 0xFF is NaN, so a scale row that is still all 0xFF after
-# loading is one the checkpoint never filled.
+# An E4M3 byte of 0xFF is NaN, so a scale tile that is still all 0xFF after
+# loading is one the checkpoint never filled. The loader copies whole tensors
+# or asserts, so the first 128x4 tile speaks for the tensor.
 _UNLOADED_SCALE_BYTE = 0xFF
+_SCALE_TILE_BYTES = NVFP4_ROW_TILE * 4
 
 
 def validate_nvfp4_geometry(output_size: int, input_size: int) -> None:
@@ -82,8 +102,13 @@ def nvfp4_scale_shape(output_size: int, input_size: int) -> tuple[int, int]:
 
 
 def nvfp4_weight_global_scale(weight: torch.Tensor) -> torch.Tensor:
-    """The per-tensor scale ``convert_model_to_nvfp4`` uses: E4M3 max times E2M1 max over amax."""
-    amax = weight.float().abs().nan_to_num().max()
+    """The per-tensor scale ``convert_model_to_nvfp4`` uses: E4M3 max times E2M1 max over amax.
+
+    Unlike the runtime converter this refuses NaN or infinite weights instead of
+    mapping them to zero, because a checkpoint written from them would be wrong
+    forever.
+    """
+    amax = weight.float().abs().max()
     if not torch.isfinite(amax) or amax <= 0:
         raise ValueError("MiniMax-H3 NVFP4 global scale needs a finite, non-zero weight amax")
     return ((_E4M3_MAX * _E2M1_MAX) / amax).to(torch.float32)
@@ -96,9 +121,12 @@ def serialized_nvfp4_quantization_config(
 ) -> dict[str, Any]:
     """The ``config.json`` ``quantization_config`` the converter writes and ``from_config`` accepts.
 
-    ``keep_bf16`` lists projection suffixes such as ``mlp.down_proj`` that stay
+    ``keep_bf16`` lists projection kinds from ``LANGUAGE_PROJECTIONS`` that stay
     bf16 in every language layer; they are appended to ``modules_to_not_convert``.
     """
+    unknown = sorted(set(keep_bf16) - set(LANGUAGE_PROJECTIONS))
+    if unknown:
+        raise ValueError(f"keep_bf16 names unknown projection kinds {unknown}; choose from {LANGUAGE_PROJECTIONS}")
     config: dict[str, Any] = {
         "quant_method": "nvfp4",
         "activation_scheme": "dynamic",
@@ -113,16 +141,17 @@ def serialized_nvfp4_quantization_config(
     return config
 
 
-def _require_flashinfer_fp4() -> Any:
-    """Resolve FlashInfer's FP4 entry points; raises with an install hint when absent."""
-    return _require_flashinfer()
+def _quantize_activation_nvfp4(x_2d: torch.Tensor, global_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize one bf16 activation the way ``NVFP4QuantizeMethod`` does: unit global scale, 128x4 layout.
 
-
-def _quantize_activation_nvfp4(x_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize one bf16 activation the way ``NVFP4QuantizeMethod`` does: unit global scale, 128x4 layout."""
-    sf_layout, _, _ = _require_flashinfer_fp4()
-    global_scale = torch.ones((), dtype=torch.float32, device=x_2d.device)
-    return _nvfp4_quantize(x_2d, global_scale, sfLayout=sf_layout.layout_128x4, do_shuffle=False)
+    The scale tensor is returned as uint8 bytes whatever dtype FlashInfer labels
+    it with, so it always matches the uint8 weight scales the checkpoint stores.
+    """
+    sf_layout, _, _ = _require_flashinfer()
+    x_fp4, x_scale = _nvfp4_quantize(x_2d, global_scale, sfLayout=sf_layout.layout_128x4, do_shuffle=False)
+    if x_scale.dtype != torch.uint8:
+        x_scale = x_scale.view(torch.uint8)
+    return x_fp4, x_scale
 
 
 def _nvfp4_linear(
@@ -147,22 +176,21 @@ def _nvfp4_linear(
 
 
 class MiniMaxH3SerializedNVFP4Config(QuantizationConfig):
-    """Serialized 16-group NVFP4 contract for the H3 text encoder."""
+    """Serialized 16-group NVFP4 contract for the H3 text encoder.
 
-    def __init__(self, group_size: int, scale_layout: str, bf16_suffixes: tuple[str, ...] = ()) -> None:
+    The group size and scale layout are fixed by the loader's parameter shapes,
+    so the only state is which projection kinds the checkpoint kept in bf16.
+    """
+
+    def __init__(self, bf16_projections: tuple[str, ...] = ()) -> None:
         super().__init__()
-        if group_size != NVFP4_GROUP_SIZE:
-            raise ValueError(f"MiniMax-H3 serialized NVFP4 requires group_size={NVFP4_GROUP_SIZE}, got {group_size}")
-        if scale_layout != NVFP4_SCALE_LAYOUT:
-            raise ValueError(f"MiniMax-H3 serialized NVFP4 requires scale_layout={NVFP4_SCALE_LAYOUT!r}, "
-                             f"got {scale_layout!r}")
-        self.group_size = group_size
-        self.scale_layout = scale_layout
-        # Projection suffixes the checkpoint kept in bf16 in every language
-        # layer, e.g. ("mlp.down_proj",). Those linears load a plain weight.
-        self.bf16_suffixes = tuple(bf16_suffixes)
-        self.is_checkpoint_nvfp4_serialized = True
-        self.activation_scheme = "dynamic"
+        unknown = sorted(set(bf16_projections) - set(LANGUAGE_PROJECTIONS))
+        if unknown:
+            raise ValueError(f"MiniMax-H3 serialized NVFP4 cannot keep unknown projection kinds {unknown} in bf16; "
+                             f"choose from {LANGUAGE_PROJECTIONS}")
+        # Projection kinds the checkpoint kept in bf16 in every language layer,
+        # e.g. ("mlp.down_proj",). Those linears load a plain weight.
+        self.bf16_projections = tuple(bf16_projections)
 
     @classmethod
     def get_name(cls) -> str:
@@ -185,35 +213,47 @@ class MiniMaxH3SerializedNVFP4Config(QuantizationConfig):
         quant_method = str(config.get("quant_method", "")).lower()
         if quant_method != "nvfp4":
             raise ValueError(f"MiniMax-H3 serialized NVFP4 config got quant_method {quant_method!r}")
-        if str(config.get("activation_scheme", "dynamic")).lower() != "dynamic":
+        missing = [key for key in _REQUIRED_METADATA_KEYS if key not in config]
+        if missing:
+            raise ValueError("MiniMax-H3 serialized NVFP4 requires explicit quantization_config fields; "
+                             f"missing {missing}")
+        if str(config["activation_scheme"]).lower() != "dynamic":
             raise ValueError("MiniMax-H3 serialized NVFP4 requires dynamic activation quantization")
-        if str(config.get("fmt", "e2m1")).lower() not in ("e2m1", "float4_e2m1fn", "nvfp4"):
-            raise ValueError(f"MiniMax-H3 serialized NVFP4 requires E2M1 weights, got {config.get('fmt')!r}")
-        if str(config.get("scale_fmt", "e4m3")).lower() not in ("e4m3", "float8_e4m3fn"):
-            raise ValueError(f"MiniMax-H3 serialized NVFP4 requires E4M3 block scales, got {config.get('scale_fmt')!r}")
-        group_size = config.get("group_size", NVFP4_GROUP_SIZE)
-        if not isinstance(group_size, int) or isinstance(group_size, bool):
-            raise ValueError("MiniMax-H3 serialized NVFP4 group_size must be an integer")
-        scale_layout = str(config.get("scale_layout", NVFP4_SCALE_LAYOUT))
-        ignored_layers = config.get("modules_to_not_convert", config.get("ignored_layers", []))
+        if str(config["fmt"]).lower() not in ("e2m1", "float4_e2m1fn", "nvfp4"):
+            raise ValueError(f"MiniMax-H3 serialized NVFP4 requires E2M1 weights, got {config['fmt']!r}")
+        if str(config["scale_fmt"]).lower() not in ("e4m3", "float8_e4m3fn"):
+            raise ValueError(f"MiniMax-H3 serialized NVFP4 requires E4M3 block scales, got {config['scale_fmt']!r}")
+        group_size = config["group_size"]
+        if isinstance(group_size, bool) or group_size != NVFP4_GROUP_SIZE:
+            raise ValueError(f"MiniMax-H3 serialized NVFP4 requires group_size={NVFP4_GROUP_SIZE}, got {group_size!r}")
+        if config["scale_layout"] != NVFP4_SCALE_LAYOUT:
+            raise ValueError(f"MiniMax-H3 serialized NVFP4 requires scale_layout={NVFP4_SCALE_LAYOUT!r}, "
+                             f"got {config['scale_layout']!r}")
+        ignored_layers = config["modules_to_not_convert"]
         if not isinstance(ignored_layers, list | tuple):
             raise ValueError("MiniMax-H3 serialized NVFP4 modules_to_not_convert must be a sequence")
-        if not any(isinstance(name, str) and "visual" in name for name in ignored_layers):
+        bf16_projections: list[str] = []
+        saw_visual = False
+        for name in ignored_layers:
+            if not isinstance(name, str) or not name:
+                raise ValueError("MiniMax-H3 serialized NVFP4 modules_to_not_convert entries must be non-empty "
+                                 f"strings, got {name!r}")
+            if "visual" in name:
+                saw_visual = True
+            elif name == "lm_head" or name.endswith(".lm_head"):
+                continue
+            elif name in LANGUAGE_PROJECTIONS:
+                bf16_projections.append(name)
+            else:
+                # A whole projection kind may stay bf16 across every language
+                # layer; a single layer, a typo, or an HF-style full path is not
+                # a contract this loader supports.
+                raise ValueError("MiniMax-H3 serialized NVFP4 keeps bf16 per projection kind only; "
+                                 f"modules_to_not_convert entry {name!r} is not one of {LANGUAGE_PROJECTIONS}")
+        if not saw_visual:
             raise ValueError("MiniMax-H3 serialized NVFP4 requires the vision stack to be listed in "
                              "modules_to_not_convert")
-        bf16_suffixes: list[str] = []
-        for name in ignored_layers:
-            if not isinstance(name, str) or "visual" in name or name == "lm_head" or name.endswith(".lm_head"):
-                continue
-            # A whole projection kind may stay bf16 across every language layer
-            # (``mlp.down_proj``); excluding individual layers is not a contract
-            # this loader supports.
-            if "layers." in name or name.startswith("language_model") or ".language_model." in name:
-                raise ValueError("MiniMax-H3 serialized NVFP4 keeps bf16 per projection kind, not per layer; "
-                                 f"got modules_to_not_convert entry {name!r}. Use a suffix such as "
-                                 "'mlp.down_proj'.")
-            bf16_suffixes.append(name)
-        return cls(group_size, scale_layout, tuple(bf16_suffixes))
+        return cls(tuple(bf16_projections))
 
     def validate_runtime(self, device: torch.device) -> None:
         if device.type != "cuda":
@@ -226,25 +266,43 @@ class MiniMaxH3SerializedNVFP4Config(QuantizationConfig):
         if capability[0] not in (10, 12):
             raise RuntimeError("MiniMax-H3 serialized NVFP4 runs FlashInfer's Blackwell FP4 GEMM; "
                                f"got unsupported sm{capability_number}")
-        _require_flashinfer_fp4()
+        if get_tp_world_size() > 1:
+            raise NotImplementedError("MiniMax-H3 serialized NVFP4 supports a single GPU: packed FP4 columns and "
+                                      "128x4 swizzled scale rows cannot be narrowed per tensor-parallel rank")
+        sf_layout, _, _ = _require_flashinfer()
+        if not hasattr(sf_layout, "layout_128x4"):
+            raise RuntimeError("The installed flashinfer has no SfLayout.layout_128x4; MiniMax-H3 serialized NVFP4 "
+                               "checkpoints store their scales in that layout")
+        _register_ops_once()
 
     def is_kept_bf16(self, prefix: str) -> bool:
-        return any(prefix == suffix or prefix.endswith("." + suffix) for suffix in self.bf16_suffixes)
+        return any(prefix == name or prefix.endswith("." + name) for name in self.bf16_projections)
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if not isinstance(layer, LinearBase) or ".language_model.layers." not in prefix:
             return None
         if self.is_kept_bf16(prefix):
             return None
-        return MiniMaxH3SerializedNVFP4LinearMethod(self.group_size)
+        return MiniMaxH3SerializedNVFP4LinearMethod()
+
+
+def _strict_dtype_loader(base_loader):
+    """Wrap a layer's weight loader so a checkpoint tensor must carry the parameter's exact dtype."""
+
+    def load(param: torch.Tensor, loaded_weight: torch.Tensor, *args: Any, **kwargs: Any):
+        if loaded_weight.dtype != param.dtype:
+            raise ValueError("Serialized MiniMax-H3 NVFP4 tensors must be stored as their declared dtype; "
+                             f"got {loaded_weight.dtype} for a {param.dtype} parameter of shape {tuple(param.shape)}")
+        if base_loader is None:
+            param.data.copy_(loaded_weight.reshape(param.shape))
+            return None
+        return base_loader(param, loaded_weight, *args, **kwargs)
+
+    return load
 
 
 class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
     """Execute serialized NVFP4 weights without re-quantizing them."""
-
-    def __init__(self, group_size: int) -> None:
-        super().__init__()
-        self.group_size = group_size
 
     def create_weights(
         self,
@@ -256,9 +314,6 @@ class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        if get_tp_world_size() > 1:
-            raise NotImplementedError("MiniMax-H3 serialized NVFP4 supports a single GPU: packed FP4 columns and "
-                                      "128x4 swizzled scale rows cannot be narrowed per tensor-parallel rank")
         output_size_per_partition = sum(output_partition_sizes)
         validate_nvfp4_geometry(output_size_per_partition, input_size_per_partition)
 
@@ -267,13 +322,17 @@ class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
 
-        weight_loader = extra_weight_attrs.get("weight_loader")
+        # No input_dim/output_dim: these tensors are not shardable, and without
+        # the attributes the weight loaders copy them whole. The copy is a numeric
+        # cast, so a checkpoint that stored scales as float8 bytes would be
+        # silently converted value by value; refuse any dtype but the declared one.
+        loader_attrs = {"weight_loader": _strict_dtype_loader(extra_weight_attrs.get("weight_loader"))}
         weight_packed = Parameter(
             torch.zeros(nvfp4_packed_weight_shape(output_size_per_partition, input_size_per_partition),
                         dtype=torch.uint8),
             requires_grad=False,
         )
-        set_weight_attrs(weight_packed, {"input_dim": 1, "output_dim": 0, "weight_loader": weight_loader})
+        set_weight_attrs(weight_packed, loader_attrs)
         layer.register_parameter("weight_packed", weight_packed)
 
         weight_scale = Parameter(
@@ -282,51 +341,49 @@ class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
                        dtype=torch.uint8),
             requires_grad=False,
         )
-        set_weight_attrs(weight_scale, {"input_dim": 1, "output_dim": 0, "weight_loader": weight_loader})
+        set_weight_attrs(weight_scale, loader_attrs)
         layer.register_parameter("weight_scale", weight_scale)
 
         weight_global_scale = Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
-        set_weight_attrs(weight_global_scale, {"weight_loader": weight_loader})
+        set_weight_attrs(weight_global_scale, loader_attrs)
         layer.register_parameter("weight_global_scale", weight_global_scale)
         # No bf16 weight ever exists on this layer; ``None`` keeps ``layer.weight``
         # readable for code that inspects it, matching the purged NVFP4 path.
         layer.register_parameter("weight", None)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        weight_packed = getattr(layer, "weight_packed", None)
-        weight_scale = getattr(layer, "weight_scale", None)
-        weight_global_scale = getattr(layer, "weight_global_scale", None)
-        if weight_packed is None or weight_scale is None or weight_global_scale is None:
-            raise ValueError("Serialized MiniMax-H3 NVFP4 linear is missing weight_packed, weight_scale "
-                             "or weight_global_scale")
-        if weight_packed.dtype != torch.uint8 or weight_scale.dtype != torch.uint8:
-            raise ValueError("Serialized MiniMax-H3 NVFP4 weight_packed and weight_scale must be uint8, got "
-                             f"{weight_packed.dtype} and {weight_scale.dtype}")
-        if weight_global_scale.dtype != torch.float32:
-            raise ValueError("Serialized MiniMax-H3 NVFP4 weight_global_scale must be float32, "
-                             f"got {weight_global_scale.dtype}")
-        output_size = layer.output_size_per_partition
-        input_size = layer.input_size_per_partition
-        expected_packed = nvfp4_packed_weight_shape(output_size, input_size)
-        expected_scale = nvfp4_scale_shape(output_size, input_size)
-        if tuple(weight_packed.shape) != expected_packed:
-            raise ValueError("Serialized MiniMax-H3 NVFP4 weight_packed shape mismatch: "
-                             f"expected {expected_packed}, got {tuple(weight_packed.shape)}")
-        if tuple(weight_scale.shape) != expected_scale:
-            raise ValueError("Serialized MiniMax-H3 NVFP4 weight_scale shape mismatch: "
-                             f"expected {expected_scale}, got {tuple(weight_scale.shape)}")
-        if not bool(torch.isfinite(weight_global_scale).all()) or bool((weight_global_scale <= 0).any()):
+        """Reject a layer the checkpoint did not fill and derive the GEMM multiplier.
+
+        Shapes and dtypes are fixed by ``create_weights`` and enforced by the
+        weight loader's copy, and the loader reports missing tensors by name
+        before this runs; what remains is content a copied tensor can still get
+        wrong: a non-positive global scale, or a scale tile left at its 0xFF
+        initializer by a direct caller that bypassed the loader.
+        """
+        weight_scale = layer.weight_scale
+        global_scale = float(layer.weight_global_scale.item())
+        if not (global_scale > 0) or global_scale == float("inf"):
             raise ValueError("Serialized MiniMax-H3 NVFP4 weight_global_scale was not loaded: "
-                             "it must be a finite positive value")
-        if bool((weight_scale == _UNLOADED_SCALE_BYTE).all()):
-            raise ValueError("Serialized MiniMax-H3 NVFP4 weight_scale was not loaded: every byte is still 0xFF")
-        layer.weight_packed.data = weight_packed.data
-        layer.weight_scale.data = weight_scale.data
-        layer.weight_global_scale.data = weight_global_scale.data
+                             f"it must be a finite positive value, got {global_scale}")
+        if bool((weight_scale.view(-1)[:_SCALE_TILE_BYTES] == _UNLOADED_SCALE_BYTE).all()):
+            raise ValueError("Serialized MiniMax-H3 NVFP4 weight_scale was not loaded: its first tile is still 0xFF")
         # ``mm_fp4`` folds both global scales into one multiplier. Activations use a
         # unit global scale, so the multiplier is the inverse weight global scale.
-        alpha = (1.0 / weight_global_scale.data.float()).reshape(())
-        layer.register_buffer("_nvfp4_alpha", alpha, persistent=False)
+        device = weight_scale.device
+        layer.register_buffer("_nvfp4_alpha", torch.tensor(1.0 / global_scale, dtype=torch.float32, device=device),
+                              persistent=False)
+        layer.register_buffer("_nvfp4_x_global_scale", torch.ones((), dtype=torch.float32, device=device),
+                              persistent=False)
+
+    @staticmethod
+    def _apply_finalized(layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        x = _coerce_fp4_input_dtype(x)
+        original_shape = x.shape
+        x_fp4, x_scale = _quantize_activation_nvfp4(x.reshape(-1, original_shape[-1]), layer._nvfp4_x_global_scale)
+        output = _nvfp4_linear(x_fp4, x_scale, layer.weight_packed, layer.weight_scale, layer._nvfp4_alpha)
+        if bias is not None:
+            output = output + bias
+        return output.view(*original_shape[:-1], output.shape[-1])
 
     def apply(
         self,
@@ -336,30 +393,14 @@ class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if x.device.type != "cuda":
             raise RuntimeError("MiniMax-H3 serialized NVFP4 execution requires CUDA")
-        capability = torch.cuda.get_device_capability(x.device)
-        capability_number = capability[0] * 10 + capability[1]
-        if capability_number < MiniMaxH3SerializedNVFP4Config.get_min_capability():
-            raise RuntimeError("MiniMax-H3 serialized NVFP4 requires GPU capability "
-                               f"sm{MiniMaxH3SerializedNVFP4Config.get_min_capability()} or newer, "
-                               f"got sm{capability_number}")
-        alpha = getattr(layer, "_nvfp4_alpha", None)
-        if alpha is None:
+        if getattr(layer, "_nvfp4_alpha", None) is None:
             raise RuntimeError("MiniMax-H3 serialized NVFP4 linear was not finalized: "
                                "process_weights_after_loading has not run")
-
-        x = _coerce_fp4_input_dtype(x)
-        original_shape = x.shape
-        x_2d = x.reshape(-1, original_shape[-1])
-        if not x_2d.is_contiguous():
-            x_2d = x_2d.contiguous()
-        x_fp4, x_scale = _quantize_activation_nvfp4(x_2d)
-        output = _nvfp4_linear(x_fp4, x_scale, layer.weight_packed, layer.weight_scale, alpha)
-        if bias is not None:
-            output = output + bias
-        return output.view(*original_shape[:-1], output.shape[-1])
+        return self._apply_finalized(layer, x, bias)
 
 
 __all__ = [
+    "LANGUAGE_PROJECTIONS",
     "MiniMaxH3SerializedNVFP4Config",
     "MiniMaxH3SerializedNVFP4LinearMethod",
     "NVFP4_GROUP_SIZE",
