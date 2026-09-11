@@ -36,11 +36,16 @@ linears unquantized. The SwiGLU product feeding ``down_proj`` carries the
 widest activation outliers in the stack; measured on one GB10 it is the
 projection whose 4-bit form moves the layer-50 output most.
 
-``--report-only`` quantizes every language linear, prints the relative error
-of the FP4 GEMM against the bf16 product per projection kind, and writes
-nothing. ``--num-layers`` keeps a different number of language layers; it
-must cover the layer H3 reads and is written into the checkpoint so the
-loader follows it.
+Every quantized linear is probed: random bf16 rows go through the same
+``mm_fp4`` path the loader runs and the relative error against the bf16
+product must stay under ``--max-probe-error``, otherwise the conversion stops
+and removes what it wrote. The genuine W4A4 noise on random inputs is about
+0.13; a wrong scale layout reads as 1.0. ``--report-only`` runs the probe and
+writes nothing. The kept layer count is the one the conditioner builds, 50
+for H3, and is also written into ``config.json`` for a directory used as the
+``text_encoder`` component; when the checkpoint is supplied through
+``text_encoder_weights`` the model structure comes from the model directory,
+which builds the same 50 layers.
 """
 
 from __future__ import annotations
@@ -62,6 +67,7 @@ from fastvideo.configs.models.encoders.minimax_h3_qwen3_vl import MiniMaxH3Qwen3
 from fastvideo.layers.quantization.nvfp4_config import _nvfp4_quantize, _require_flashinfer
 from fastvideo.models.encoders.minimax_h3_checkpoint_nvfp4 import (
     LANGUAGE_PROJECTIONS,
+    NVFP4_TENSOR_SUFFIXES,
     _nvfp4_linear,
     _quantize_activation_nvfp4,
     nvfp4_packed_weight_shape,
@@ -88,15 +94,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--src", type=Path, required=True, help="text_encoder directory of the bf16 checkpoint")
     parser.add_argument("--dst", type=Path, help="text_encoder directory to write (required unless --report-only)")
-    parser.add_argument("--num-layers", type=int, default=None,
-                        help="language layers to keep; default: what the conditioner builds, 50 for H3")
     parser.add_argument("--keep-bf16", action="append", default=[], metavar="PROJ",
                         help="projection kind to leave in bf16 in every layer, e.g. mlp.down_proj; "
                         "repeat or comma-separate for several")
     parser.add_argument("--device", default="cuda", help="CUDA device that runs the quantizer")
     parser.add_argument("--shard-size-gb", type=float, default=4.0, help="safetensors shard size")
     parser.add_argument("--probe-rows", type=int, default=512,
-                        help="rows of random activations per linear for the error report, 0 disables it")
+                        help="rows of random activations per linear for the error probe, 0 disables it")
+    parser.add_argument("--max-probe-error", type=float, default=0.5,
+                        help="stop when a linear's FP4 GEMM relative error exceeds this; W4A4 noise is about 0.13")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--report-only", action="store_true", help="quantize and report errors, write nothing")
     args = parser.parse_args()
@@ -106,6 +112,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--probe-rows must be 0 or positive")
     if args.shard_size_gb <= 0:
         parser.error("--shard-size-gb must be positive")
+    if args.max_probe_error <= 0:
+        parser.error("--max-probe-error must be positive")
     keep = [name.strip() for entry in args.keep_bf16 for name in entry.split(",") if name.strip()]
     unknown = sorted(set(keep) - set(LANGUAGE_PROJECTIONS))
     if unknown:
@@ -117,27 +125,28 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def layer_plan(source_config: dict, requested: int | None) -> tuple[int, int, int]:
-    """Return (kept, total, tap): how many language layers to keep, how many the
-    source has, and the hidden state H3 reads, all derived the way the model
-    derives them from the same config.json."""
+def layer_plan(source_config: dict) -> tuple[int, int, int]:
+    """Return (kept, total, tap): the language layers the conditioner builds from
+    this config.json, how many the source has, and the hidden state H3 reads,
+    derived the way the model derives them."""
     model_config = MiniMaxH3Qwen3VLConfig()
     model_config.update_model_arch(source_config)
     arch = model_config.arch_config
     total = int(arch.num_hidden_layers)
     tap = int(arch.output_hidden_state_index)
     override = getattr(arch, "num_hidden_layers_override", None)
-    default_kept = min(total, int(override)) if override else total
-    kept = default_kept if requested is None else requested
-    if not tap <= kept <= total:
-        raise SystemExit(f"--num-layers must be within [{tap}, {total}]: H3 reads hidden state {tap} and the "
-                         f"source has {total} language layers; got {kept}")
+    kept = min(total, int(override)) if override else total
     return kept, total, tap
 
 
-def scan_source(shards: list[str], kept: int) -> tuple[Counter, int]:
-    """Count the language linears the conversion will touch before any work starts."""
+def scan_source(shards: list[str], kept: int) -> tuple[Counter, int, dict[str, set[int]]]:
+    """Count the language linears the conversion will touch before any work starts.
+
+    Returns per-projection counts below ``kept``, the highest language layer index
+    seen, and the layer indexes present per projection for diagnostics.
+    """
     counts: Counter = Counter()
+    layers_seen: dict[str, set[int]] = {proj: set() for proj in LANGUAGE_PROJECTIONS}
     highest_layer = -1
     for shard in shards:
         with safe_open(shard, framework="pt", device="cpu") as handle:
@@ -148,7 +157,8 @@ def scan_source(shards: list[str], kept: int) -> tuple[Counter, int]:
                 linear_match = LANGUAGE_LINEAR.match(key)
                 if linear_match is not None and int(linear_match["layer"]) < kept:
                     counts[linear_match["proj"]] += 1
-    return counts, highest_layer
+                    layers_seen[linear_match["proj"]].add(int(linear_match["layer"]))
+    return counts, highest_layer, layers_seen
 
 
 class ShardWriter:
@@ -166,6 +176,7 @@ class ShardWriter:
         self.weight_map: dict[str, str] = {}
         self.total_bytes = 0
         self.shard_index = 0
+        self.written: list[Path] = []
 
     def add(self, name: str, tensor: torch.Tensor) -> None:
         nbytes = tensor.numel() * tensor.element_size()
@@ -182,6 +193,7 @@ class ShardWriter:
         filename = f"model-{self.shard_index:05d}.partial.safetensors"
         if self.dst is not None:
             save_file(self.pending, str(self.dst / filename), metadata={"format": "pt"})
+            self.written.append(self.dst / filename)
         for name in self.pending:
             self.weight_map[name] = filename
         self.pending = {}
@@ -197,10 +209,17 @@ class ShardWriter:
             final = f"model-{index:05d}-of-{self.shard_index:05d}.safetensors"
             (self.dst / partial).rename(self.dst / final)
             final_names[partial] = final
+        self.written = [self.dst / final for final in final_names.values()]
         weight_map = {name: final_names[partial] for name, partial in self.weight_map.items()}
         index_payload = {"metadata": {"total_size": self.total_bytes}, "weight_map": weight_map}
         (self.dst / SAFE_WEIGHTS_INDEX_NAME).write_text(json.dumps(index_payload, indent=2, sort_keys=True),
                                                         encoding="utf-8")
+
+    def abort(self) -> None:
+        """Remove every shard this writer produced so a failed conversion leaves no half checkpoint."""
+        for path in self.written:
+            path.unlink(missing_ok=True)
+        self.written = []
 
 
 def probe_relative_error(
@@ -230,6 +249,8 @@ def quantize_language_linear(
     sf_layout: object,
     probe_rows: int,
     generator: torch.Generator | None,
+    max_probe_error: float,
+    key: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float | None]:
     if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(f"Expected a bf16, fp16 or fp32 source weight, got {weight.dtype}; "
@@ -253,6 +274,10 @@ def quantize_language_linear(
     error = None
     if probe_rows and generator is not None:
         error = probe_relative_error(weight_device, packed, scale, global_scale, probe_rows, generator)
+        if not error <= max_probe_error:
+            raise SystemExit(f"FP4 GEMM relative error {error:.3e} on {key or 'a language linear'} exceeds "
+                             f"--max-probe-error {max_probe_error}; the packed layout or scales do not reproduce "
+                             "the bf16 product, nothing was written")
     return packed.cpu().contiguous(), scale.cpu().contiguous(), global_scale.reshape(1).cpu(), error
 
 
@@ -275,18 +300,22 @@ def main() -> None:
         raise SystemExit(f"{src} already carries a quantization_config "
                          f"({source_config['quantization_config'].get('quant_method')!r}); this converter "
                          "quantizes the bf16 text_encoder, not a serialized one")
-    kept, total, tap = layer_plan(source_config, args.num_layers)
+    kept, total, tap = layer_plan(source_config)
 
     shards = resolve_safetensors_files(str(src))
-    counts, highest_layer = scan_source(shards, kept)
-    if highest_layer + 1 < kept:
-        raise SystemExit(f"{src} holds {highest_layer + 1} language layers, cannot keep {kept}")
+    counts, highest_layer, layers_seen = scan_source(shards, kept)
     if not counts:
         raise SystemExit(f"No language linear in {src} matches model.language_model.layers.N.<proj>.weight; "
                          "this converter expects the Qwen3-VL checkpoint layout")
-    short = {proj: counts[proj] for proj in LANGUAGE_PROJECTIONS if counts[proj] != kept}
+    if highest_layer + 1 < kept:
+        raise SystemExit(f"{src} holds {highest_layer + 1} language layers but the conditioner builds {kept}")
+    short = {}
+    for proj in LANGUAGE_PROJECTIONS:
+        missing = sorted(set(range(kept)) - layers_seen[proj])
+        if missing:
+            short[proj] = f"{len(missing)} missing, e.g. model.language_model.layers.{missing[0]}.{proj}.weight"
     if short:
-        raise SystemExit(f"Expected {kept} of every language projection, found {short}")
+        raise SystemExit(f"Expected {kept} of every language projection below layer {kept}: {short}")
 
     device = torch.device(args.device)
     if device.type != "cuda":
@@ -297,8 +326,11 @@ def main() -> None:
     if not args.report_only:
         dst = args.dst
         dst.mkdir(parents=True, exist_ok=True)
-        if any(dst.glob("*.safetensors")):
-            raise SystemExit(f"{dst} already holds safetensors shards; refusing to mix outputs")
+        existing = sorted(path.name for path in dst.glob("*.safetensors")) + \
+            [name for name in ("config.json", SAFE_WEIGHTS_INDEX_NAME) if (dst / name).exists()]
+        if existing:
+            raise SystemExit(f"{dst} already holds {existing[:4]}{' and more' if len(existing) > 4 else ''}; "
+                             "refusing to overwrite or mix outputs")
     writer = ShardWriter(dst, int(args.shard_size_gb * (1 << 30)))
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.probe_rows else None
 
@@ -311,45 +343,52 @@ def main() -> None:
     written_language_bytes = 0
     errors: dict[str, list[float]] = {}
     started = time.perf_counter()
-    print(f"keeping {kept} of {total} language layers (H3 reads hidden state {tap}); "
+    print(f"keeping {kept} of {total} language layers, H3 reads hidden state {tap}; "
           f"{sum(counts.values())} language linears to visit", flush=True)
+    packed_name, scale_name, global_scale_name = NVFP4_TENSOR_SUFFIXES
 
-    for shard in shards:
-        with safe_open(shard, framework="pt", device="cpu") as handle:
-            for key in sorted(handle.keys()):
-                layer_match = LANGUAGE_LAYER.match(key)
-                if key == "lm_head.weight":
-                    skipped["lm_head"] += 1
-                    continue
-                if layer_match is not None and int(layer_match["layer"]) >= kept:
-                    skipped["upper_layers"] += 1
-                    continue
-                tensor = handle.get_tensor(key)
-                linear_match = LANGUAGE_LINEAR.match(key)
-                if linear_match is None:
-                    writer.add(key, tensor.contiguous())
-                    copied += 1
-                    continue
-                if linear_match["proj"] in args.keep_bf16:
-                    writer.add(key, tensor.contiguous())
-                    kept_bf16 += 1
-                    kept_bf16_bytes += tensor.numel() * tensor.element_size()
-                    continue
-                packed, scale, global_scale, error = quantize_language_linear(
-                    tensor, device, sf_layout, args.probe_rows, generator)
-                prefix = key[:-len(".weight")]
-                writer.add(prefix + ".weight_packed", packed)
-                writer.add(prefix + ".weight_scale", scale)
-                writer.add(prefix + ".weight_global_scale", global_scale)
-                source_language_bytes += tensor.numel() * tensor.element_size()
-                written_language_bytes += packed.numel() + scale.numel() + 4
-                quantized += 1
-                if error is not None:
-                    errors.setdefault(linear_match["proj"], []).append(error)
-                if quantized % 35 == 0:
-                    print(f"  quantized {quantized} language linears ({time.perf_counter() - started:.0f}s)",
-                          flush=True)
-    writer.finish()
+    try:
+        for shard in shards:
+            with safe_open(shard, framework="pt", device="cpu") as handle:
+                for key in sorted(handle.keys()):
+                    layer_match = LANGUAGE_LAYER.match(key)
+                    if key == "lm_head.weight":
+                        skipped["lm_head"] += 1
+                        continue
+                    if layer_match is not None and int(layer_match["layer"]) >= kept:
+                        skipped["upper_layers"] += 1
+                        continue
+                    tensor = handle.get_tensor(key)
+                    linear_match = LANGUAGE_LINEAR.match(key)
+                    if linear_match is None:
+                        writer.add(key, tensor.contiguous())
+                        copied += 1
+                        continue
+                    if linear_match["proj"] in args.keep_bf16:
+                        # Kept linears are stored as bf16 whatever the source dtype, matching the
+                        # precision the conditioner runs them in.
+                        writer.add(key, tensor.to(torch.bfloat16).contiguous())
+                        kept_bf16 += 1
+                        kept_bf16_bytes += tensor.numel() * 2
+                        continue
+                    packed, scale, global_scale, error = quantize_language_linear(
+                        tensor, device, sf_layout, args.probe_rows, generator, args.max_probe_error, key)
+                    prefix = key[:-len(".weight")]
+                    writer.add(f"{prefix}.{packed_name}", packed)
+                    writer.add(f"{prefix}.{scale_name}", scale)
+                    writer.add(f"{prefix}.{global_scale_name}", global_scale)
+                    source_language_bytes += tensor.numel() * tensor.element_size()
+                    written_language_bytes += packed.numel() + scale.numel() + 4
+                    quantized += 1
+                    if error is not None:
+                        errors.setdefault(linear_match["proj"], []).append(error)
+                    if quantized % 35 == 0:
+                        print(f"  quantized {quantized} language linears, {time.perf_counter() - started:.0f}s",
+                              flush=True)
+        writer.finish()
+    except BaseException:
+        writer.abort()
+        raise
 
     if dst is not None:
         config = dict(source_config)
@@ -380,12 +419,15 @@ def main() -> None:
     print(f"artifact total: {writer.total_bytes / 1e9:.2f} GB in {writer.shard_index} shard(s)"
           f"{'' if dst is not None else ' (not written, --report-only)'}")
     if errors:
-        print(f"FP4 GEMM relative error vs bf16, {args.probe_rows} random rows per linear:")
+        print(f"FP4 GEMM relative error vs bf16, {args.probe_rows} random rows per linear, "
+              f"every linear under --max-probe-error {args.max_probe_error}:")
         print(f"  {'projection':<20}{'linears':>8}{'max':>12}{'mean':>12}")
         for proj in LANGUAGE_PROJECTIONS:
             values = errors.get(proj)
             if values:
                 print(f"  {proj:<20}{len(values):>8}{max(values):>12.3e}{sum(values) / len(values):>12.3e}")
+    elif quantized:
+        print("FP4 GEMM error probe skipped because --probe-rows is 0; nothing verified the written layout")
     print(f"done in {time.perf_counter() - started:.0f}s")
 
 

@@ -28,15 +28,24 @@ import torch
 
 from fastvideo.configs.models.encoders.minimax_h3_qwen3_vl import MiniMaxH3Qwen3VLConfig
 from fastvideo.distributed import cleanup_dist_env_and_memory, maybe_init_distributed_environment_and_model_parallel
+from fastvideo.models.encoders.minimax_h3_checkpoint_nvfp4 import MiniMaxH3SerializedNVFP4LinearMethod
 from fastvideo.models.loader.component_loader import TextEncoderLoader
 
 PROMPTS = (
     "an alpine lake at sunrise, gentle wind over the water",
     "a red fox crosses fresh snow at sunrise",
     "a busy night market in Taipei, neon signs reflecting on wet pavement, handheld camera",
+    # Longer than one 128-row FlashInfer tile, so the activation path crosses a tile boundary.
+    "A slow cinematic drone shot glides over a coastal town at golden hour: terracotta rooftops, laundry "
+    "lines swaying between balconies, a fishing boat returning to the harbor with gulls trailing behind it, "
+    "children chasing a ball down a cobblestone lane, an old man reading on a bench under a lemon tree, "
+    "waves breaking softly against the pier while a church bell rings twice, warm haze softening the "
+    "distant hills, the camera finally settling on a cafe terrace where a waiter pours coffee and a cat "
+    "stretches in the last patch of sunlight before the shadows reach the water.",
 )
-MIN_MEAN_COSINE = float(os.environ.get("MINIMAX_H3_NVFP4_MIN_COSINE", "0.98"))
-MAX_RELATIVE_ERROR = float(os.environ.get("MINIMAX_H3_NVFP4_MAX_REL_ERR", "0.30"))
+MIN_MEAN_COSINE = float(os.environ.get("MINIMAX_H3_NVFP4_MIN_COSINE", "0.99"))
+MIN_TOKEN_COSINE = float(os.environ.get("MINIMAX_H3_NVFP4_MIN_TOKEN_COSINE", "0.95"))
+MAX_RELATIVE_ERROR = float(os.environ.get("MINIMAX_H3_NVFP4_MAX_REL_ERR", "0.10"))
 
 
 def _require_assets() -> tuple[torch.device, Path, Path]:
@@ -90,8 +99,13 @@ def _loader_args() -> SimpleNamespace:
     )
 
 
-def _encode(text_encoder_dir: Path, tokenizer, device: torch.device) -> list[torch.Tensor]:
+def _encode(text_encoder_dir: Path, tokenizer, device: torch.device,
+            expect_nvfp4: bool) -> list[torch.Tensor]:
     model = TextEncoderLoader().load(str(text_encoder_dir), _loader_args())
+    probe = model.language_model.layers[0].self_attn.q_proj
+    is_nvfp4 = isinstance(probe.quant_method, MiniMaxH3SerializedNVFP4LinearMethod) and probe.weight is None
+    assert is_nvfp4 == expect_nvfp4, (f"{text_encoder_dir} loaded {'through' if is_nvfp4 else 'without'} the "
+                                      "serialized NVFP4 path")
     outputs = []
     for prompt in PROMPTS:
         ids = torch.tensor(tokenizer(prompt, add_special_tokens=False)["input_ids"], dtype=torch.long, device=device)
@@ -108,8 +122,9 @@ def test_minimax_h3_text_encoder_nvfp4_parity() -> None:
 
     device, root, converted = _require_assets()
     tokenizer = AutoTokenizer.from_pretrained(root / "tokenizer", local_files_only=True)
-    reference = _encode(root / "text_encoder", tokenizer, device)
-    quantized = _encode(converted, tokenizer, device)
+    reference = _encode(root / "text_encoder", tokenizer, device, expect_nvfp4=False)
+    quantized = _encode(converted, tokenizer, device, expect_nvfp4=True)
+    assert any(tensor.shape[0] > 128 for tensor in reference), "no prompt crosses a 128-row tile"
 
     print(f"\n{'prompt':<60}{'tokens':>7}{'cos mean':>10}{'cos min':>9}{'rel err':>10}", flush=True)
     for prompt, expected, actual in zip(PROMPTS, reference, quantized, strict=True):
@@ -118,5 +133,6 @@ def test_minimax_h3_text_encoder_nvfp4_parity() -> None:
         relative_error = ((expected - actual).norm() / expected.norm()).item()
         print(f"{prompt[:58]:<60}{expected.shape[0]:>7}{cosine.mean().item():>10.4f}{cosine.min().item():>9.4f}"
               f"{relative_error:>10.3e}", flush=True)
-        assert cosine.mean().item() >= MIN_MEAN_COSINE, f"{prompt!r}: mean cosine {cosine.mean().item():.4f}"
-        assert relative_error <= MAX_RELATIVE_ERROR, f"{prompt!r}: relative error {relative_error:.3e}"
+        assert cosine.mean().item() >= MIN_MEAN_COSINE, f"{prompt[:40]!r}: mean cosine {cosine.mean().item():.4f}"
+        assert cosine.min().item() >= MIN_TOKEN_COSINE, f"{prompt[:40]!r}: min cosine {cosine.min().item():.4f}"
+        assert relative_error <= MAX_RELATIVE_ERROR, f"{prompt[:40]!r}: relative error {relative_error:.3e}"

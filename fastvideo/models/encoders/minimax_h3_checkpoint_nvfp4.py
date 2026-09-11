@@ -73,6 +73,10 @@ LANGUAGE_PROJECTIONS = (
     "mlp.up_proj",
     "mlp.down_proj",
 )
+# The three tensors a quantized linear stores, as parameter names on the layer
+# and as checkpoint key suffixes. The converter imports these so both sides
+# spell them once.
+NVFP4_TENSOR_SUFFIXES = ("weight_packed", "weight_scale", "weight_global_scale")
 _REQUIRED_METADATA_KEYS = ("activation_scheme", "fmt", "group_size", "scale_fmt", "scale_layout",
                            "modules_to_not_convert")
 _E2M1_MAX = 6.0
@@ -111,7 +115,10 @@ def nvfp4_weight_global_scale(weight: torch.Tensor) -> torch.Tensor:
     amax = weight.float().abs().max()
     if not torch.isfinite(amax) or amax <= 0:
         raise ValueError("MiniMax-H3 NVFP4 global scale needs a finite, non-zero weight amax")
-    return ((_E4M3_MAX * _E2M1_MAX) / amax).to(torch.float32)
+    scale = ((_E4M3_MAX * _E2M1_MAX) / amax).to(torch.float32)
+    if not torch.isfinite(scale):
+        raise ValueError(f"MiniMax-H3 NVFP4 global scale overflowed float32 for weight amax {amax.item():.3e}")
+    return scale
 
 
 def serialized_nvfp4_quantization_config(
@@ -288,14 +295,13 @@ class MiniMaxH3SerializedNVFP4Config(QuantizationConfig):
 
 def _strict_dtype_loader(base_loader):
     """Wrap a layer's weight loader so a checkpoint tensor must carry the parameter's exact dtype."""
+    if base_loader is None:
+        raise ValueError("MiniMax-H3 serialized NVFP4 linears need the layer's weight_loader")
 
     def load(param: torch.Tensor, loaded_weight: torch.Tensor, *args: Any, **kwargs: Any):
         if loaded_weight.dtype != param.dtype:
             raise ValueError("Serialized MiniMax-H3 NVFP4 tensors must be stored as their declared dtype; "
                              f"got {loaded_weight.dtype} for a {param.dtype} parameter of shape {tuple(param.shape)}")
-        if base_loader is None:
-            param.data.copy_(loaded_weight.reshape(param.shape))
-            return None
         return base_loader(param, loaded_weight, *args, **kwargs)
 
     return load
@@ -327,13 +333,14 @@ class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
         # cast, so a checkpoint that stored scales as float8 bytes would be
         # silently converted value by value; refuse any dtype but the declared one.
         loader_attrs = {"weight_loader": _strict_dtype_loader(extra_weight_attrs.get("weight_loader"))}
+        packed_name, scale_name, global_scale_name = NVFP4_TENSOR_SUFFIXES
         weight_packed = Parameter(
             torch.zeros(nvfp4_packed_weight_shape(output_size_per_partition, input_size_per_partition),
                         dtype=torch.uint8),
             requires_grad=False,
         )
         set_weight_attrs(weight_packed, loader_attrs)
-        layer.register_parameter("weight_packed", weight_packed)
+        layer.register_parameter(packed_name, weight_packed)
 
         weight_scale = Parameter(
             torch.full(nvfp4_scale_shape(output_size_per_partition, input_size_per_partition),
@@ -342,11 +349,11 @@ class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
             requires_grad=False,
         )
         set_weight_attrs(weight_scale, loader_attrs)
-        layer.register_parameter("weight_scale", weight_scale)
+        layer.register_parameter(scale_name, weight_scale)
 
         weight_global_scale = Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
         set_weight_attrs(weight_global_scale, loader_attrs)
-        layer.register_parameter("weight_global_scale", weight_global_scale)
+        layer.register_parameter(global_scale_name, weight_global_scale)
         # No bf16 weight ever exists on this layer; ``None`` keeps ``layer.weight``
         # readable for code that inspects it, matching the purged NVFP4 path.
         layer.register_parameter("weight", None)
@@ -379,6 +386,9 @@ class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
     def _apply_finalized(layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         x = _coerce_fp4_input_dtype(x)
         original_shape = x.shape
+        if x.numel() == 0:
+            # An empty prompt has nothing to quantize; the FP4 kernels are not defined for zero rows.
+            return x.new_zeros(*original_shape[:-1], layer.output_size_per_partition, dtype=torch.bfloat16)
         x_fp4, x_scale = _quantize_activation_nvfp4(x.reshape(-1, original_shape[-1]), layer._nvfp4_x_global_scale)
         output = _nvfp4_linear(x_fp4, x_scale, layer.weight_packed, layer.weight_scale, layer._nvfp4_alpha)
         if bias is not None:
@@ -402,6 +412,7 @@ class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
 
 __all__ = [
     "LANGUAGE_PROJECTIONS",
+    "NVFP4_TENSOR_SUFFIXES",
     "MiniMaxH3SerializedNVFP4Config",
     "MiniMaxH3SerializedNVFP4LinearMethod",
     "NVFP4_GROUP_SIZE",

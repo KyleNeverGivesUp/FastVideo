@@ -11,13 +11,17 @@ os.environ.setdefault("MASTER_ADDR", "localhost")
 os.environ.setdefault("MASTER_PORT", "29515")
 
 import fastvideo.models.encoders.minimax_h3_checkpoint_nvfp4 as h3_nvfp4
-from fastvideo.configs.models.encoders.minimax_h3_qwen3_vl import MiniMaxH3Qwen3VLConfig
+from fastvideo.configs.models.encoders.minimax_h3_qwen3_vl import (
+    MiniMaxH3Qwen3VLArchConfig,
+    MiniMaxH3Qwen3VLConfig,
+)
 from fastvideo.layers.linear import ColumnParallelLinear, RowParallelLinear, UnquantizedLinearMethod
 from fastvideo.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod, VocabParallelEmbedding
 from fastvideo.models.encoders.base import TextEncoder
 from fastvideo.models.encoders.minimax_h3_checkpoint_fp8 import MiniMaxH3SerializedFP8Config
 from fastvideo.models.encoders.minimax_h3_checkpoint_nvfp4 import (
     LANGUAGE_PROJECTIONS,
+    NVFP4_TENSOR_SUFFIXES,
     MiniMaxH3SerializedNVFP4Config,
     MiniMaxH3SerializedNVFP4LinearMethod,
     serialized_nvfp4_quantization_config,
@@ -354,6 +358,7 @@ def test_nvfp4_linear_hands_mm_fp4_transposed_operands_and_a_bf16_output(monkeyp
     assert output.shape == (4, 256)
     assert output.dtype == torch.bfloat16
     assert receipt["a"] is x_fp4
+    assert receipt["a_scale"] is x_scale
     assert receipt["b"].shape == (64, 256)
     assert receipt["b"].data_ptr() == weight_packed.data_ptr()
     assert receipt["b_scale"].shape == (8, 256)
@@ -394,3 +399,85 @@ def test_apply_flattens_quantizes_and_restores_the_leading_dims(distributed_setu
     assert output.shape == (1, 5, 256)
     assert output.dtype == torch.bfloat16
     assert torch.equal(output, torch.full((1, 5, 256), 3.0, dtype=torch.bfloat16))
+
+
+def _tiny_conditioner_config(keep_bf16: tuple[str, ...] = ("mlp.down_proj", )) -> MiniMaxH3Qwen3VLConfig:
+    """One language layer whose linears satisfy the FlashInfer tile geometry, and a small vision tower."""
+    config = MiniMaxH3Qwen3VLConfig()
+    config.arch_config = MiniMaxH3Qwen3VLArchConfig(
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        output_hidden_state_index=1,
+        num_hidden_layers_override=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=128,
+        rope_scaling={
+            "mrope_interleaved": True,
+            "mrope_section": [32, 16, 16],
+            "rope_type": "default",
+        },
+        vision_depth=1,
+        vision_hidden_size=64,
+        vision_intermediate_size=128,
+        vision_num_heads=1,
+        vision_deepstack_visual_indexes=(),
+        vision_out_hidden_size=128,
+    )
+    config.quant_config = MiniMaxH3SerializedNVFP4Config.from_config(
+        _checkpoint_quantization_config(modules_to_not_convert=["model.visual", "lm_head", *keep_bf16]))
+    return config
+
+
+def test_conditioner_loads_converter_named_tensors_end_to_end(distributed_setup) -> None:
+    """The real chain: a conditioner built with the NVFP4 config, checkpoint keys spelled the way the
+    converter writes them, ``load_weights``, the strict missing-tensor check, then the post-load hook."""
+    model = MiniMaxH3Qwen3VLConditioner(_tiny_conditioner_config())
+    layer = model.language_model.layers[0]
+    assert isinstance(layer.self_attn.q_proj.quant_method, MiniMaxH3SerializedNVFP4LinearMethod)
+    assert isinstance(layer.self_attn.o_proj.quant_method, MiniMaxH3SerializedNVFP4LinearMethod)
+    assert isinstance(layer.mlp.down_proj.quant_method, UnquantizedLinearMethod)
+    assert layer.self_attn.q_proj.weight is None and layer.mlp.down_proj.weight is not None
+
+    packed_name, scale_name, global_scale_name = NVFP4_TENSOR_SUFFIXES
+    checkpoint: dict[str, torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        if name.endswith("." + packed_name):
+            tensor = torch.full_like(param, 0x11)
+        elif name.endswith("." + scale_name):
+            tensor = torch.full_like(param, E4M3_ONE)
+        elif name.endswith("." + global_scale_name):
+            tensor = torch.full_like(param, 2.0)
+        else:
+            tensor = torch.zeros_like(param)
+        checkpoint["model." + name] = tensor
+    expected = {name for name, _ in model.named_parameters()}
+    assert sum(name.endswith("." + packed_name) for name in expected) == 6
+
+    loaded = model.load_weights(iter(checkpoint.items()))
+    assert loaded == expected
+    assert _process_quantized_text_encoder_weights(model, torch.device("cpu")) == 6
+    assert layer.self_attn.q_proj._nvfp4_alpha.item() == pytest.approx(0.5)
+    assert layer.mlp.up_proj._nvfp4_alpha.item() == pytest.approx(0.5)
+
+    # A tensor the checkpoint lacks is reported by name through the loaded set, which is what the
+    # loader's strict check subtracts, and the hook then refuses the unfilled layer.
+    missing = f"model.language_model.layers.0.mlp.up_proj.{scale_name}"
+    layer.mlp.up_proj.weight_scale.data.fill_(0xFF)
+    partial = {key: value for key, value in checkpoint.items() if key != missing}
+    loaded = model.load_weights(iter(partial.items()))
+    assert expected - loaded == {missing[len("model."):]}
+    with pytest.raises(ValueError, match="weight_scale was not loaded"):
+        _process_quantized_text_encoder_weights(model, torch.device("cpu"))
+
+    wrong_dtype = dict(checkpoint)
+    wrong_dtype[missing] = wrong_dtype[missing].to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="declared dtype"):
+        model.load_weights(iter(wrong_dtype.items()))
+
+    stray = dict(checkpoint)
+    stray["model.language_model.layers.0.self_attn.q_proj.weight"] = torch.zeros(128, 128)
+    with pytest.raises(ValueError, match="Unexpected"):
+        model.load_weights(iter(stray.items()))
