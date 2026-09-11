@@ -382,7 +382,8 @@ class MiniMaxH3SerializedNVFP4LinearMethod(LinearMethodBase):
         x_fp4, x_scale = _quantize_activation_nvfp4(x.reshape(-1, original_shape[-1]), layer._nvfp4_x_global_scale)
         output = _nvfp4_linear(x_fp4, x_scale, layer.weight_packed, layer.weight_scale, layer._nvfp4_alpha)
         if bias is not None:
-            output = output + bias
+            # The GEMM emits bf16; keep it that way whatever dtype the bias was built in.
+            output = output + bias.to(output.dtype)
         return output.view(*original_shape[:-1], output.shape[-1])
 
     def apply(
