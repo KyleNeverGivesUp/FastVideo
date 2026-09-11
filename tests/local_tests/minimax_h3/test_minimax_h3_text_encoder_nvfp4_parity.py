@@ -35,14 +35,9 @@ PROMPTS = (
     "an alpine lake at sunrise, gentle wind over the water",
     "a red fox crosses fresh snow at sunrise",
     "a busy night market in Taipei, neon signs reflecting on wet pavement, handheld camera",
-    # Longer than one 128-row FlashInfer tile, so the activation path crosses a tile boundary.
-    "A slow cinematic drone shot glides over a coastal town at golden hour: terracotta rooftops, laundry "
-    "lines swaying between balconies, a fishing boat returning to the harbor with gulls trailing behind it, "
-    "children chasing a ball down a cobblestone lane, an old man reading on a bench under a lemon tree, "
-    "waves breaking softly against the pier while a church bell rings twice, warm haze softening the "
-    "distant hills, the camera finally settling on a cafe terrace where a waiter pours coffee and a cat "
-    "stretches in the last patch of sunlight before the shadows reach the water.",
 )
+# The activation quantizer works in 128-row tiles; one prompt must be longer than that.
+LONG_PROMPT_MIN_TOKENS = 160
 MIN_MEAN_COSINE = float(os.environ.get("MINIMAX_H3_NVFP4_MIN_COSINE", "0.99"))
 MIN_TOKEN_COSINE = float(os.environ.get("MINIMAX_H3_NVFP4_MIN_TOKEN_COSINE", "0.95"))
 MAX_RELATIVE_ERROR = float(os.environ.get("MINIMAX_H3_NVFP4_MAX_REL_ERR", "0.10"))
@@ -99,15 +94,25 @@ def _loader_args() -> SimpleNamespace:
     )
 
 
-def _encode(text_encoder_dir: Path, tokenizer, device: torch.device,
-            expect_nvfp4: bool) -> list[torch.Tensor]:
+def _prompt_longer_than_one_tile(tokenizer) -> str:
+    """Grow a descriptive prompt until the tokenizer yields more than one 128-row tile of tokens."""
+    scene = ("a slow cinematic drone shot glides over a coastal town at golden hour, terracotta rooftops, "
+             "laundry lines between balconies, a fishing boat returning to the harbor with gulls behind it")
+    prompt = scene
+    while len(tokenizer(prompt, add_special_tokens=False)["input_ids"]) < LONG_PROMPT_MIN_TOKENS:
+        prompt += ", then " + scene
+    return prompt
+
+
+def _encode(text_encoder_dir: Path, tokenizer, device: torch.device, expect_nvfp4: bool,
+            prompts: tuple[str, ...]) -> list[torch.Tensor]:
     model = TextEncoderLoader().load(str(text_encoder_dir), _loader_args())
     probe = model.language_model.layers[0].self_attn.q_proj
     is_nvfp4 = isinstance(probe.quant_method, MiniMaxH3SerializedNVFP4LinearMethod) and probe.weight is None
     assert is_nvfp4 == expect_nvfp4, (f"{text_encoder_dir} loaded {'through' if is_nvfp4 else 'without'} the "
                                       "serialized NVFP4 path")
     outputs = []
-    for prompt in PROMPTS:
+    for prompt in prompts:
         ids = torch.tensor(tokenizer(prompt, add_special_tokens=False)["input_ids"], dtype=torch.long, device=device)
         with torch.inference_mode():
             outputs.append(model(input_ids=ids).float().cpu())
@@ -122,12 +127,13 @@ def test_minimax_h3_text_encoder_nvfp4_parity() -> None:
 
     device, root, converted = _require_assets()
     tokenizer = AutoTokenizer.from_pretrained(root / "tokenizer", local_files_only=True)
-    reference = _encode(root / "text_encoder", tokenizer, device, expect_nvfp4=False)
-    quantized = _encode(converted, tokenizer, device, expect_nvfp4=True)
-    assert any(tensor.shape[0] > 128 for tensor in reference), "no prompt crosses a 128-row tile"
+    prompts = (*PROMPTS, _prompt_longer_than_one_tile(tokenizer))
+    reference = _encode(root / "text_encoder", tokenizer, device, expect_nvfp4=False, prompts=prompts)
+    quantized = _encode(converted, tokenizer, device, expect_nvfp4=True, prompts=prompts)
+    assert reference[-1].shape[0] > 128, "the long prompt must cross a 128-row tile"
 
     print(f"\n{'prompt':<60}{'tokens':>7}{'cos mean':>10}{'cos min':>9}{'rel err':>10}", flush=True)
-    for prompt, expected, actual in zip(PROMPTS, reference, quantized, strict=True):
+    for prompt, expected, actual in zip(prompts, reference, quantized, strict=True):
         assert actual.shape == expected.shape
         cosine = torch.nn.functional.cosine_similarity(expected, actual, dim=-1)
         relative_error = ((expected - actual).norm() / expected.norm()).item()
